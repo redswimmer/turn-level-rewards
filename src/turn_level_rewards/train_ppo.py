@@ -198,11 +198,31 @@ def compute_ppo_loss(
     value_loss = _masked_mean((new_values - returns) ** 2, action_mask)
     kl = _masked_mean(new_logprobs - old_logprobs, action_mask)
     loss = policy_loss + value_loss_coef * value_loss + kl_beta * kl
+
+    # Diagnostic-only fields (no gradient contribution) -- mirror TRL's own PPOTrainer metric
+    # set (`val/ratio`, `val/ratio_var`, `policy/clipfrac_avg` -- see
+    # docs/trl/v1.9.0/ppo_trainer's "Explanation of the logged metrics"), the standard PPO
+    # health signals for diagnosing an unstable run from trackio curves alone. clip_fraction
+    # uses the raw (pre-clip) ratio against the same clip_eps bounds compute_ppo_loss itself
+    # clips to, so it reports exactly what fraction of this batch's surrogate objective was
+    # actually clamped. To avoid inf * 0.0 = nan when masking out positions with very large
+    # exponents, we replace inf values with a large but finite sentinel (1e6) for the
+    # diagnostic computation -- this preserves the "clipped or not" decision (both are way outside
+    # bounds) while avoiding nan propagation.
+    ratio_safe = torch.where(torch.isinf(ratio), torch.full_like(ratio, 1e6), ratio)
+    ratio_mean = _masked_mean(ratio_safe, action_mask)
+    ratio_variance = _masked_mean((ratio_safe - ratio_mean) ** 2, action_mask)
+    is_clipped = (ratio < 1.0 - clip_eps) | (ratio > 1.0 + clip_eps)
+    clip_fraction = _masked_mean(is_clipped.float(), action_mask)
+
     return {
         "loss": loss,
         "policy_loss": policy_loss.detach(),
         "value_loss": value_loss.detach(),
         "kl": kl.detach(),
+        "ratio_mean": ratio_mean.detach(),
+        "ratio_variance": ratio_variance.detach(),
+        "clip_fraction": clip_fraction.detach(),
     }
 
 
@@ -644,7 +664,15 @@ class MTPPOTrainer(Trainer):
         with the single-RTX-4090, 0.8B-model memory profile the rest of this repo already
         established.
         """
-        totals = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "kl": 0.0}
+        totals = {
+            "loss": 0.0,
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "kl": 0.0,
+            "ratio_mean": 0.0,
+            "ratio_variance": 0.0,
+            "clip_fraction": 0.0,
+        }
         num_updates = 0
         # self.args.num_ppo_epochs is a real field on this file's MTPPOConfig, but Trainer's
         # base type stub only knows self.args as the looser `TrainingArguments` -- same
@@ -718,9 +746,16 @@ class MTPPOTrainer(Trainer):
                 real_policy_loss = policy_loss_dict["policy_loss"]
                 real_kl = policy_loss_dict["kl"]
                 real_value_loss = value_loss_dict["value_loss"]
+                # ratio_mean/ratio_variance/clip_fraction come from pass 1 (real new_logprobs)
+                # for the same reason real_policy_loss/real_kl do -- pass 2's ratio is always
+                # exactly 1.0 (old_logprobs vs itself), which would silently dilute these
+                # diagnostics toward "everything looks fine" if averaged in.
                 totals["policy_loss"] += real_policy_loss.item()
                 totals["kl"] += real_kl.item()
                 totals["value_loss"] += real_value_loss.item()
+                totals["ratio_mean"] += policy_loss_dict["ratio_mean"].item()
+                totals["ratio_variance"] += policy_loss_dict["ratio_variance"].item()
+                totals["clip_fraction"] += policy_loss_dict["clip_fraction"].item()
                 totals["loss"] += (
                     real_policy_loss
                     + self.args.value_loss_coef * real_value_loss  # ty: ignore[unresolved-attribute]
@@ -832,6 +867,9 @@ class MTPPOTrainer(Trainer):
                 "policy_loss": update_metrics["policy_loss"],
                 "value_loss": update_metrics["value_loss"],
                 "kl": update_metrics["kl"],
+                "ratio_mean": update_metrics["ratio_mean"],
+                "ratio_variance": update_metrics["ratio_variance"],
+                "clip_fraction": update_metrics["clip_fraction"],
                 "reward": mean_reward,
                 "retrieval_fraction": mean_retrieval_fraction,
             }

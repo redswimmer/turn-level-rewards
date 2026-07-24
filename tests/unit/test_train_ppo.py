@@ -218,6 +218,46 @@ def test_compute_ppo_loss_value_loss_scales_with_squared_error():
     assert result["loss"].item() == pytest.approx(0.5 * 4.0)  # value_loss_coef defaults to 0.5
 
 
+def test_compute_ppo_loss_reports_clip_fraction_and_ratio_mean():
+    """Position 0: new_logprobs=10.0 vs old_logprobs=0.0 -> ratio=exp(10), clipped (clip_eps=0.2).
+    Position 1: new_logprobs==old_logprobs -> ratio=1.0, not clipped. clip_fraction should be
+    exactly 0.5 (one of two positions clipped); ratio_mean should be the plain mean of the two
+    raw (pre-clip) ratios.
+    """
+    result = compute_ppo_loss(
+        new_logprobs=torch.tensor([10.0, 0.0]),
+        old_logprobs=torch.tensor([0.0, 0.0]),
+        advantages=torch.tensor([1.0, 1.0]),
+        returns=torch.tensor([0.0, 0.0]),
+        new_values=torch.tensor([0.0, 0.0]),
+        action_mask=torch.tensor([1.0, 1.0]),
+        clip_eps=0.2,
+    )
+
+    expected_ratio_mean = (torch.exp(torch.tensor(10.0)).item() + 1.0) / 2
+    assert result["clip_fraction"].item() == pytest.approx(0.5)
+    assert result["ratio_mean"].item() == pytest.approx(expected_ratio_mean, rel=1e-4)
+
+
+def test_compute_ppo_loss_diagnostic_fields_ignore_masked_out_positions():
+    """action_mask=0 at position 1 (a wild, would-be-clipped ratio) must not count toward
+    clip_fraction or ratio_mean -- only the masked-in position 0 (ratio=1.0, not clipped)
+    should be visible.
+    """
+    result = compute_ppo_loss(
+        new_logprobs=torch.tensor([0.0, 999.0]),
+        old_logprobs=torch.tensor([0.0, 0.0]),
+        advantages=torch.tensor([1.0, 1.0]),
+        returns=torch.tensor([0.0, 0.0]),
+        new_values=torch.tensor([0.0, 0.0]),
+        action_mask=torch.tensor([1.0, 0.0]),
+        clip_eps=0.2,
+    )
+
+    assert result["clip_fraction"].item() == pytest.approx(0.0)
+    assert result["ratio_mean"].item() == pytest.approx(1.0)
+
+
 def test_build_ppo_config_fixed_hyperparameters_identical_across_conditions():
     """These come from the paper (Section 6.2/C.1.3) or the design spec's stated assumptions --
     every one must hold for BOTH conditions, since ppo/mt_ppo differ only in reward placement
