@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from turn_level_rewards.train_ppo import (
     MTPPOTrainer,
+    _final_retrieval_fraction,
     _parse_args,
     _PolicyAndCritic,
     build_ppo_config,
@@ -370,3 +371,12 @@ def test_parse_args_overrides():
     assert args.train_size == 90447
     assert args.max_steps == 500
     assert args.num_rollouts_per_step == 8
+
+
+def test_final_retrieval_fraction_returns_zero_for_no_turns():
+    assert _final_retrieval_fraction({"retrieval_fraction_after_each_turn": []}) == 0.0
+
+
+def test_final_retrieval_fraction_returns_last_value():
+    rollout = {"retrieval_fraction_after_each_turn": [0.5, 1.0]}
+    assert _final_retrieval_fraction(rollout) == 1.0

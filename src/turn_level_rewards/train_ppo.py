@@ -269,6 +269,15 @@ def build_policy_and_critic(model_name: str = MODEL_NAME) -> _PolicyAndCritic:
     return _PolicyAndCritic(policy, critic)
 
 
+def _final_retrieval_fraction(rollout: dict) -> float:
+    """The episode's final (cumulative) retrieval_fraction -- 0.0 if the episode made no search
+    calls at all. Shared by _collect_batch (train-time) and evaluate_ppo.py (eval-time) so both
+    extract this the same way.
+    """
+    fractions = rollout["retrieval_fraction_after_each_turn"]
+    return fractions[-1] if fractions else 0.0
+
+
 class MTPPOTrainer(Trainer):
     """Custom multi-turn PPO trainer with tool-calling, built directly on transformers.Trainer.
 
@@ -613,11 +622,7 @@ class MTPPOTrainer(Trainer):
             outcome_r = outcome_reward([completion], [row["golden_answers"]])[0]
             format_and_outcome_reward = format_r + outcome_r
 
-            retrieval_fraction = (
-                rollout["retrieval_fraction_after_each_turn"][-1]
-                if rollout["retrieval_fraction_after_each_turn"]
-                else 0.0
-            )
+            retrieval_fraction = _final_retrieval_fraction(rollout)
 
             per_token_rewards = place_turn_rewards(
                 num_tokens=len(old_values),
@@ -649,6 +654,7 @@ class MTPPOTrainer(Trainer):
                     "advantages": torch.tensor(advantages, device=old_values.device),
                     "returns": torch.tensor(returns, device=old_values.device),
                     "format_and_outcome_reward": format_and_outcome_reward,
+                    "format_reward": format_r,
                     "retrieval_fraction": retrieval_fraction,
                     "question": row["question"],
                     "completion": completion,
