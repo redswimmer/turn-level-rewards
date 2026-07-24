@@ -13,6 +13,7 @@ import itertools
 import json
 import math
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -28,7 +29,8 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
-from transformers.trainer_utils import set_seed
+from transformers.trainer_callback import TrainerState
+from transformers.trainer_utils import get_last_checkpoint, rotate_checkpoints, set_seed
 from trl.chat_template_utils import add_response_schema, get_training_chat_template, parse_response
 
 from turn_level_rewards.env import SearchEnv
@@ -160,6 +162,8 @@ class MTPPOConfig(TrainingArguments):
     num_ppo_epochs: int = 4
     value_loss_coef: float = 0.5
     num_rollouts_per_step: int = 2
+    save_steps: int = 50
+    save_total_limit: int = 3
     max_completion_length: int = 2048
     project: str = "turn-level-rewards-ppo"
 
@@ -169,6 +173,8 @@ def build_ppo_config(
     seed: int,
     max_steps: int,
     num_rollouts_per_step: int,
+    save_steps: int = 50,
+    save_total_limit: int = 3,
 ) -> MTPPOConfig:
     """Build the MTPPOConfig for a training run. Mirrors train.py's build_config role from
     Phase 4 -- fixed hyperparameters are baked in here, not exposed as independent CLI flags.
@@ -188,6 +194,8 @@ def build_ppo_config(
         num_ppo_epochs=4,
         value_loss_coef=0.5,
         num_rollouts_per_step=num_rollouts_per_step,
+        save_steps=save_steps,
+        save_total_limit=save_total_limit,
         max_completion_length=2048,
         logging_steps=1,
         run_name=condition,
@@ -378,6 +386,20 @@ def _final_retrieval_fraction(rollout: dict) -> float:
     """
     fractions = rollout["retrieval_fraction_after_each_turn"]
     return fractions[-1] if fractions else 0.0
+
+
+def _row_cycle_from_step(
+    rows: list[dict], global_step: int, num_rollouts_per_step: int
+) -> Iterator[dict]:
+    """An infinite cycle over rows, fast-forwarded to the position a from-scratch run would be
+    at after global_step completed steps -- so resuming from a checkpoint reproduces the exact
+    same data order a run that never stopped would have seen. itertools.cycle over a fixed list
+    is deterministic, so replaying the same number of draws always lands in the same place.
+    """
+    cycle = itertools.cycle(rows)
+    for _ in range(global_step * num_rollouts_per_step):
+        next(cycle)
+    return cycle
 
 
 class MTPPOTrainer(Trainer):
@@ -899,6 +921,68 @@ class MTPPOTrainer(Trainer):
         self.model.policy.save_pretrained(output_path / "policy")  # ty: ignore[call-non-callable, unresolved-attribute]
         self.model.critic.save_pretrained(output_path / "critic")  # ty: ignore[call-non-callable, unresolved-attribute]
 
+    def _save_full_checkpoint(self, output_dir: str) -> None:
+        """Save everything needed to resume training exactly where it left off: policy+critic
+        weights (via _save_policy_and_critic, which already correctly handles Qwen3.5's tied
+        lm_head/embed_tokens weights), plus optimizer/RNG/step state via transformers.Trainer's
+        own inherited primitives -- the same ones TRL's own PPOTrainer relies on (PPOConfig
+        subclasses TrainingArguments directly and exposes resume_from_checkpoint/save_steps,
+        confirmed against trl==1.9.0). Not unit-tested: _save_optimizer_and_scheduler and
+        _save_rng_state are inherited, untouched Trainer methods that write real optimizer
+        state/RNG snapshots to disk -- validated by Task 7's live smoke test instead. See
+        docs/superpowers/specs/2026-07-23-phase-7b-full-ppo-runs-design.md.
+
+        Ends by calling transformers' own rotate_checkpoints (the same disk-retention function
+        Trainer's built-in _save_checkpoint uses) to delete older checkpoint-N directories beyond
+        self.args.save_total_limit -- a full checkpoint here (weights+optimizer+RNG) is far larger
+        than the weights-only ~3GB this repo has measured so far (AdamW's two per-parameter
+        moment buffers, same bf16 dtype as the params, roughly double each model's own memory),
+        so leaving every checkpoint on disk for a 500-step run would exhaust this machine's disk
+        -- not a hypothetical, confirmed by direct calculation before this method was written this
+        way. rotate_checkpoints always protects the most-recent checkpoint (needed for resume),
+        so this never deletes the one train()'s own resume path would need.
+        """
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        self._save_policy_and_critic(output_dir)
+        self._save_optimizer_and_scheduler(output_dir)
+        self._save_rng_state(output_dir)
+        self.state.save_to_json(str(Path(output_dir) / "trainer_state.json"))
+        rotate_checkpoints(
+            output_dir=str(Path(output_dir).parent),
+            save_total_limit=self.args.save_total_limit,
+            use_mtime=False,
+        )
+
+    def _load_full_checkpoint(self, checkpoint_dir: str) -> None:
+        """Inverse of _save_full_checkpoint -- reloads policy+critic weights, optimizer/RNG
+        state, and global_step, so train() can resume exactly where a prior run left off. Not
+        unit-tested: loads real weights and real optimizer/RNG state from disk -- validated by
+        Task 7's live smoke test instead, same convention as build_policy_and_critic.
+        """
+        # self.model.policy.device is a real torch.device at runtime (see create_optimizer's
+        # comment for why ty can't see this through Trainer's loose self.model type). Its type is
+        # therefore Unknown to ty, which makes the immediately-following AutoModelForCausalLM
+        # .to(device) call below resolve against the wrong overload of nn.Module.to() and
+        # misreport its argument type -- safe: policy is a real PreTrainedModel instance and
+        # device is a real torch.device at runtime.
+        device = self.model.policy.device  # ty: ignore[unresolved-attribute]
+        policy = AutoModelForCausalLM.from_pretrained(
+            str(Path(checkpoint_dir) / "policy"), dtype=torch.bfloat16
+        ).to(device)  # ty: ignore[invalid-argument-type]
+        critic = AutoModelForSequenceClassification.from_pretrained(
+            str(Path(checkpoint_dir) / "critic"), num_labels=1, dtype=torch.bfloat16
+        ).to(device)
+        policy.gradient_checkpointing_enable()
+        critic.gradient_checkpointing_enable()
+        # self.model.policy/.critic are real, settable attributes of this file's _PolicyAndCritic
+        # at runtime (see create_optimizer's comment for the same root cause: ty only knows
+        # self.model as Trainer's loose base-class type, which has no `policy`/`critic` fields).
+        self.model.policy = policy  # ty: ignore[invalid-assignment]
+        self.model.critic = critic  # ty: ignore[invalid-assignment]
+        self._load_optimizer_and_scheduler(checkpoint_dir)
+        self._load_rng_state(checkpoint_dir)
+        self.state = TrainerState.load_from_json(str(Path(checkpoint_dir) / "trainer_state.json"))
+
     # train(self) intentionally narrows Trainer.train's full signature
     # (resume_from_checkpoint, trial, ignore_keys_for_eval -> TrainOutput) down to train(self)
     # -> None: PPO's collect-then-multi-epoch-update outer loop replaces Trainer's generic
@@ -930,15 +1014,23 @@ class MTPPOTrainer(Trainer):
         in _rollout_episode uses torch's global RNG).
         """
         set_seed(self.args.seed)
-        collapse_monitor = CollapseMonitor()
         self.optimizer = self.create_optimizer()
+        if self.args.resume_from_checkpoint:
+            self._load_full_checkpoint(self.args.resume_from_checkpoint)
+        collapse_monitor = CollapseMonitor()
         # self.train_dataset is typed by Trainer's base class as
         # `torch.utils.data.Dataset | datasets.arrow_dataset.Dataset | None`, and
         # torch.utils.data.Dataset's stub doesn't declare __iter__, so ty can't confirm it's
         # Iterable -- but build_ppo_trainer (Task 11) always constructs this trainer with a real
-        # datasets.Dataset, which genuinely is iterable at runtime.
+        # datasets.Dataset, which genuinely is iterable at runtime. The same untyped-Dataset root
+        # cause is why ty can't confirm the resulting list is `list[dict]` either, needed by
+        # _row_cycle_from_step's signature below.
         rows = list(self.train_dataset)  # ty: ignore[invalid-argument-type]
-        row_cycle = itertools.cycle(rows)
+        row_cycle = _row_cycle_from_step(
+            rows,  # ty: ignore[invalid-argument-type]
+            self.state.global_step,
+            self.args.num_rollouts_per_step,  # ty: ignore[unresolved-attribute]
+        )
         trackio.init(project=self.args.project, name=self.args.run_name)
 
         # self.args.output_dir is typed `str | None` on TrainingArguments (None only if a
@@ -950,7 +1042,7 @@ class MTPPOTrainer(Trainer):
         sample_completions_path = output_dir / "sample_completions.log"
 
         run_start = time.monotonic()
-        for step in range(self.args.max_steps):
+        for step in range(self.state.global_step, self.args.max_steps):
             step_start = time.monotonic()
             # self.args.num_rollouts_per_step is a real field on this file's MTPPOConfig, but
             # Trainer's base type stub only knows self.args as the looser `TrainingArguments` --
@@ -999,12 +1091,7 @@ class MTPPOTrainer(Trainer):
                     else trackio.AlertLevel.WARN,
                 )
                 if alert.should_stop:
-                    # _save_full_checkpoint doesn't exist yet -- it's added by Task 5
-                    # (checkpoint-resume), which lands after this task. Intentional forward
-                    # reference (see this task's brief); not exercised by any unit test today.
-                    self._save_full_checkpoint(  # ty: ignore[unresolved-attribute]
-                        f"{self.args.output_dir}/checkpoint-{step + 1}"
-                    )
+                    self._save_full_checkpoint(f"{self.args.output_dir}/checkpoint-{step + 1}")
                     print(f"Stopping training early at step {step + 1}: {alert.title}", flush=True)
                     return
 
@@ -1046,10 +1133,10 @@ class MTPPOTrainer(Trainer):
 
             self.state.global_step = step + 1
 
-            if (step + 1) % self.args.save_steps == 0 if self.args.save_steps else False:
-                self._save_policy_and_critic(f"{self.args.output_dir}/checkpoint-{step + 1}")
+            if (step + 1) % self.args.save_steps == 0:
+                self._save_full_checkpoint(f"{self.args.output_dir}/checkpoint-{step + 1}")
 
-        self._save_policy_and_critic(f"{self.args.output_dir}/checkpoint-{self.args.max_steps}")
+        self._save_full_checkpoint(f"{self.args.output_dir}/checkpoint-{self.args.max_steps}")
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1065,6 +1152,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--train-size", type=int, default=8)
     parser.add_argument("--max-steps", type=int, default=2)
     parser.add_argument("--num-rollouts-per-step", type=int, default=2)
+    parser.add_argument("--save-steps", type=int, default=50)
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        default=None,
+        help="Path to a checkpoint-N directory to resume from, or 'auto' to resume from the "
+        "latest checkpoint under this run's output_dir.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1100,10 +1194,19 @@ def main() -> None:
         seed=args.seed,
         max_steps=args.max_steps,
         num_rollouts_per_step=args.num_rollouts_per_step,
+        save_steps=args.save_steps,
     )
     config.run_name = (
         f"{args.condition}-{args.max_steps}steps-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     )
+    resume_from_checkpoint = args.resume_from_checkpoint
+    if resume_from_checkpoint == "auto":
+        resume_from_checkpoint = get_last_checkpoint(config.output_dir)
+        if resume_from_checkpoint is None:
+            raise ValueError(
+                f"--resume-from-checkpoint auto: no checkpoint found under {config.output_dir}"
+            )
+    config.resume_from_checkpoint = resume_from_checkpoint
     trainer = build_ppo_trainer(args.condition, args.train_size, config)
     trainer.train()
 

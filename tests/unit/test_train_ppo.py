@@ -14,6 +14,7 @@ from turn_level_rewards.train_ppo import (
     _final_retrieval_fraction,
     _parse_args,
     _PolicyAndCritic,
+    _row_cycle_from_step,
     build_ppo_config,
     compute_gae,
     compute_ppo_loss,
@@ -451,3 +452,43 @@ def test_collapse_monitor_each_alert_fires_only_once():
 
     more_alerts = monitor.check(step=25, loss=0.5, mean_reward=0.0, mean_format_reward=0.1)
     assert more_alerts == []
+
+
+def test_parse_args_resume_and_save_steps_defaults():
+    args = _parse_args(["--condition", "ppo"])
+
+    assert args.save_steps == 50
+    assert args.resume_from_checkpoint is None
+
+
+def test_parse_args_resume_and_save_steps_overrides():
+    args = _parse_args(
+        [
+            "--condition",
+            "ppo",
+            "--save-steps",
+            "10",
+            "--resume-from-checkpoint",
+            "outputs/ppo/checkpoint-100",
+        ]
+    )
+
+    assert args.save_steps == 10
+    assert args.resume_from_checkpoint == "outputs/ppo/checkpoint-100"
+
+
+def test_row_cycle_from_step_starts_at_beginning_when_global_step_is_zero():
+    rows = [{"id": 0}, {"id": 1}, {"id": 2}]
+    cycle = _row_cycle_from_step(rows, global_step=0, num_rollouts_per_step=2)
+
+    assert [next(cycle)["id"] for _ in range(3)] == [0, 1, 2]
+
+
+def test_row_cycle_from_step_resumes_at_correct_position():
+    rows = [{"id": 0}, {"id": 1}, {"id": 2}]
+    # From scratch: step 0 consumes rows 0,1; step 1 consumes rows 2,0. After global_step=2
+    # completed steps, 4 rows have been consumed (0,1,2,0) -- the next draw should be row 1.
+    cycle = _row_cycle_from_step(rows, global_step=2, num_rollouts_per_step=2)
+
+    assert next(cycle)["id"] == 1
+    assert next(cycle)["id"] == 2
