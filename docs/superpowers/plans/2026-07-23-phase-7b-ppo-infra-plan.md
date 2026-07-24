@@ -756,11 +756,23 @@ already present.
 Run: `uv run pytest tests/unit/test_train_ppo.py -k row_cycle_from_step -v`
 Expected: PASS (2 tests).
 
-- [ ] **Step 5: Add `save_steps` to `MTPPOConfig` and `build_ppo_config`**
+- [ ] **Step 5: Add `save_steps`/`save_total_limit` to `MTPPOConfig` and `build_ppo_config`**
 
-In `src/turn_level_rewards/train_ppo.py:44-63`, add `save_steps: int = 50` as a field on
-`MTPPOConfig` (after `num_rollouts_per_step: int = 2`), and add `save_steps=save_steps,` as a new
-parameter/pass-through in `build_ppo_config` (mirroring how `num_rollouts_per_step` is already
+**Why `save_total_limit` is here, not just `save_steps`**: a full checkpoint under this task
+includes optimizer state (Step 7), not just weights. AdamW keeps two moment buffers per
+parameter at the same dtype as the parameter -- since `build_policy_and_critic` loads both
+models in bf16, that's roughly 2x each model's own memory in optimizer state alone. Measured
+weights-only checkpoints from Task 1's probe were ~3GB each (policy+critic combined); a full
+checkpoint (weights+optimizer+RNG) is expected to be roughly 3x that, ~9-10GB (an analytical
+estimate pending Task 7's empirical confirmation). At `save_steps=50` over a 500-step run, that's
+up to 10 checkpoints/condition -- **without a retention limit, disk usage would be
+~90-100GB per condition**, which this repo's disk cannot absorb. `save_total_limit=3` mirrors the
+GRPO track's own existing precedent (`train.py`'s `build_config` already uses
+`save_total_limit=3`) and bounds usage to roughly 3 checkpoints' worth at a time per condition.
+
+In `src/turn_level_rewards/train_ppo.py:44-63`, add `save_steps: int = 50` and
+`save_total_limit: int = 3` as fields on `MTPPOConfig` (after `num_rollouts_per_step: int = 2`),
+and thread both through `build_ppo_config` (mirroring how `num_rollouts_per_step` is already
 threaded through):
 
 ```python
@@ -776,6 +788,7 @@ threaded through):
     value_loss_coef: float = 0.5
     num_rollouts_per_step: int = 2
     save_steps: int = 50
+    save_total_limit: int = 3
     max_completion_length: int = 2048
     project: str = "turn-level-rewards-ppo"
 
@@ -786,6 +799,7 @@ def build_ppo_config(
     max_steps: int,
     num_rollouts_per_step: int,
     save_steps: int = 50,
+    save_total_limit: int = 3,
 ) -> MTPPOConfig:
     """Build the MTPPOConfig for a training run. Mirrors train.py's build_config role from
     Phase 4 -- fixed hyperparameters are baked in here, not exposed as independent CLI flags.
@@ -806,6 +820,7 @@ def build_ppo_config(
         value_loss_coef=0.5,
         num_rollouts_per_step=num_rollouts_per_step,
         save_steps=save_steps,
+        save_total_limit=save_total_limit,
         max_completion_length=2048,
         logging_steps=1,
         run_name=condition,
@@ -817,8 +832,8 @@ def build_ppo_config(
 - [ ] **Step 6: Run existing `build_ppo_config` tests to check for regressions**
 
 Run: `uv run pytest tests/unit/test_train_ppo.py -k build_ppo_config -v`
-Expected: PASS unchanged -- `save_steps` is additive with a default, no existing call site or
-assertion references it.
+Expected: PASS unchanged -- `save_steps`/`save_total_limit` are additive with defaults, no
+existing call site or assertion references them.
 
 - [ ] **Step 7: Add `_save_full_checkpoint` and `_load_full_checkpoint`**
 
@@ -836,12 +851,27 @@ ending at line 764, right before `train()`'s `def train(self)` line):
         _save_rng_state are inherited, untouched Trainer methods that write real optimizer
         state/RNG snapshots to disk -- validated by Task 7's live smoke test instead. See
         docs/superpowers/specs/2026-07-23-phase-7b-full-ppo-runs-design.md.
+
+        Ends by calling transformers' own rotate_checkpoints (the same disk-retention function
+        Trainer's built-in _save_checkpoint uses) to delete older checkpoint-N directories beyond
+        self.args.save_total_limit -- a full checkpoint here (weights+optimizer+RNG) is far larger
+        than the weights-only ~3GB this repo has measured so far (AdamW's two per-parameter
+        moment buffers, same bf16 dtype as the params, roughly double each model's own memory),
+        so leaving every checkpoint on disk for a 500-step run would exhaust this machine's disk
+        -- not a hypothetical, confirmed by direct calculation before this method was written this
+        way. rotate_checkpoints always protects the most-recent checkpoint (needed for resume),
+        so this never deletes the one train()'s own resume path would need.
         """
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         self._save_policy_and_critic(output_dir)
         self._save_optimizer_and_scheduler(output_dir)  # ty: ignore[unresolved-attribute]
         self._save_rng_state(output_dir)  # ty: ignore[unresolved-attribute]
         self.state.save_to_json(str(Path(output_dir) / "trainer_state.json"))
+        rotate_checkpoints(
+            output_dir=str(Path(output_dir).parent),
+            save_total_limit=self.args.save_total_limit,  # ty: ignore[unresolved-attribute]
+            use_mtime=False,
+        )
 
     def _load_full_checkpoint(self, checkpoint_dir: str) -> None:
         """Inverse of _save_full_checkpoint -- reloads policy+critic weights, optimizer/RNG
@@ -866,7 +896,7 @@ ending at line 764, right before `train()`'s `def train(self)` line):
 ```
 
 Add `from transformers.trainer_callback import TrainerState` and `from transformers.trainer_utils
-import get_last_checkpoint` to the top of `train_ppo.py`'s import block.
+import get_last_checkpoint, rotate_checkpoints` to the top of `train_ppo.py`'s import block.
 
 - [ ] **Step 8: Rewire `train()` to use `_save_full_checkpoint` and support resume**
 
@@ -1279,9 +1309,20 @@ own, breaking Step 4's step-based lookup.
 - [ ] **Step 1: Run a short training run to completion, saving checkpoints frequently**
 
 Run: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m turn_level_rewards.train_ppo --condition ppo --train-size 32 --max-steps 10 --num-rollouts-per-step 2 --save-steps 3 --seed 42`
-Expected: completes all 10 steps, `outputs/ppo/checkpoint-3`, `checkpoint-6`, `checkpoint-9`,
-`checkpoint-10` all exist, each containing `policy/`, `critic/`, `optimizer.pt`, `rng_state.pth`,
-`trainer_state.json`.
+Expected: completes all 10 steps. Checkpoints are saved at steps 3, 6, 9, and 10 (4 saves), but
+`save_total_limit` defaults to 3 (Task 5's rotation fix) -- so `outputs/ppo/checkpoint-3` should
+have been **deleted** by `rotate_checkpoints`, leaving only `checkpoint-6`, `checkpoint-9`,
+`checkpoint-10` on disk. Verify this explicitly:
+
+Run: `ls outputs/ppo/ | grep '^checkpoint-'`
+Expected: exactly `checkpoint-6`, `checkpoint-9`, `checkpoint-10` -- **not** `checkpoint-3`. If
+`checkpoint-3` is still present, the rotation wiring in Task 5's `_save_full_checkpoint` didn't
+work and must be fixed before continuing (this is the whole point of `save_total_limit` --
+letting every checkpoint accumulate would exhaust this machine's disk at full 500-step scale, per
+the calculation in Task 5's Step 5).
+
+Each remaining checkpoint directory should contain `policy/`, `critic/`, `optimizer.pt`,
+`rng_state.pth`, `trainer_state.json`.
 
 - [ ] **Step 2: Verify the new diagnostic metrics appear in `train_log.jsonl`**
 
