@@ -960,6 +960,17 @@ class MTPPOTrainer(Trainer):
         """
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         self._save_policy_and_critic(output_dir)
+        # Real, research-confirmed fix, not precautionary: live smoke testing saw 6/7 CUDA OOMs
+        # land at or immediately after a checkpoint-save step boundary. Root cause (confirmed via
+        # direct transformers==5.13.0 source inspection): in this repo's single-GPU config,
+        # Trainer._save_optimizer_and_scheduler calls torch.save(self.optimizer.state_dict(), ...)
+        # directly on GPU-resident optimizer tensors (AdamW's exp_avg/exp_avg_sq) with no CPU
+        # transfer first. At this training process's real ~92-94% GPU utilization, torch.save's
+        # internal serialization needs a small amount of extra GPU-side working memory that the
+        # allocator doesn't have free, even though nothing is logically leaking. Freeing cached
+        # (allocated-but-unused) blocks here gives that save its room without touching any
+        # hyperparameter, gradient, or model output.
+        torch.cuda.empty_cache()
         self._save_optimizer_and_scheduler(output_dir)
         self._save_rng_state(output_dir)
         self.state.save_to_json(str(Path(output_dir) / "trainer_state.json"))
