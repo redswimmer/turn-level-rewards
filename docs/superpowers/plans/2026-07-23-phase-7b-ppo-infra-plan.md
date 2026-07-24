@@ -1258,9 +1258,27 @@ git commit -m "Add evaluate_ppo.py: held-out evaluation for MTPPOTrainer checkpo
 - Produces: a real, observed confirmation (not assumed) that a full run can be interrupted and
   resumed without losing progress or diverging from what an uninterrupted run would have done.
 
+**Amendment (added after Task 1's probe results, before this task started executing):** Task 1's
+probe found real OOM failures persist even with `num_rollouts_per_step=2` (~1/3 short runs), and
+that `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is a required, measured mitigation (cut
+the observed failure rate from 3/3 to 1/3) -- see
+`docs/superpowers/probes/2026-07-23-phase-7b-wallclock-probe.md`. Every `train_ppo`/`evaluate_ppo`
+command below must be run with that env var set. Task 1's probe also wrote real training records
+into `outputs/ppo/train_log.jsonl` and `outputs/mt_ppo/train_log.jsonl` (same condition, same
+`output_dir` this task's runs reuse) -- Step 0 below clears that stale data first, since Step 4's
+step-6 lookup would otherwise match a leftover record from Task 1's probe instead of this task's
+own resume test.
+
+- [ ] **Step 0: Clear stale outputs from Task 1's probe**
+
+Run: `rm -rf outputs/ppo outputs/mt_ppo`
+These are gitignored, fully-regenerated-per-run scratch directories -- safe to clear. Without
+this, `train_log.jsonl`'s append-only writes would mix Task 1's probe records with this task's
+own, breaking Step 4's step-based lookup.
+
 - [ ] **Step 1: Run a short training run to completion, saving checkpoints frequently**
 
-Run: `uv run python -m turn_level_rewards.train_ppo --condition ppo --train-size 32 --max-steps 10 --num-rollouts-per-step 2 --save-steps 3 --seed 42`
+Run: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m turn_level_rewards.train_ppo --condition ppo --train-size 32 --max-steps 10 --num-rollouts-per-step 2 --save-steps 3 --seed 42`
 Expected: completes all 10 steps, `outputs/ppo/checkpoint-3`, `checkpoint-6`, `checkpoint-9`,
 `checkpoint-10` all exist, each containing `policy/`, `critic/`, `optimizer.pt`, `rng_state.pth`,
 `trainer_state.json`.
@@ -1276,7 +1294,7 @@ Run: `rm -rf outputs/ppo_resume_test && cp -r outputs/ppo outputs/ppo_resume_tes
 
 Truncate the copy's log to simulate a crash after step 6, then resume:
 
-Run: `uv run python -m turn_level_rewards.train_ppo --condition ppo --train-size 32 --max-steps 10 --num-rollouts-per-step 2 --save-steps 3 --seed 42 --resume-from-checkpoint outputs/ppo_resume_test/checkpoint-6`
+Run: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m turn_level_rewards.train_ppo --condition ppo --train-size 32 --max-steps 10 --num-rollouts-per-step 2 --save-steps 3 --seed 42 --resume-from-checkpoint outputs/ppo_resume_test/checkpoint-6`
 
 Expected: stdout's first printed step line reads `step 7/10` (not `step 1/10`) -- confirms
 `self.state.global_step` was correctly restored to 6 and the loop range started there, not from
@@ -1304,13 +1322,13 @@ Expected: prints `OK: resumed run reproduced the same data order`.
 
 - [ ] **Step 5: Run `evaluate_ppo.py` against one of the saved checkpoints**
 
-Run: `uv run python -m turn_level_rewards.evaluate_ppo --condition ppo --checkpoint-dir outputs/ppo/checkpoint-10 --eval-size 4 --output /tmp/ppo_eval_smoke.json`
+Run: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m turn_level_rewards.evaluate_ppo --condition ppo --checkpoint-dir outputs/ppo/checkpoint-10 --eval-size 4 --output /tmp/ppo_eval_smoke.json`
 Expected: completes without error, `/tmp/ppo_eval_smoke.json` contains `exact_match`, `f1`,
 `retrieval_fraction`, `num_examples` keys with finite float/int values.
 
 - [ ] **Step 6: Repeat Steps 1-2 for `mt_ppo`**
 
-Run: `uv run python -m turn_level_rewards.train_ppo --condition mt_ppo --train-size 32 --max-steps 10 --num-rollouts-per-step 2 --save-steps 3 --seed 42`
+Run: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m turn_level_rewards.train_ppo --condition mt_ppo --train-size 32 --max-steps 10 --num-rollouts-per-step 2 --save-steps 3 --seed 42`
 Expected: same checks pass -- `mt_ppo` reward placement is untouched by this plan, so this is a
 regression check confirming the diagnostics/resume additions didn't break the `mt_ppo` path.
 
