@@ -136,14 +136,33 @@ with all four expected keys and finite values: `{"exact_match": 0.0, "f1": 0.0,
 smoke-test scale — 10 training steps × 2 rollouts is nowhere near enough to learn anything; the
 point of this check was the eval path executing and producing well-typed output, not accuracy).
 
-**mt_ppo diagnostics/rotation — confirmed identical to `ppo` on the steps that completed.**
-Every `mt_ppo` attempt that got past its first few steps produced the same shape of diagnostics
-(`ratio_mean`/`clip_fraction` present, checkpoint saves at the expected steps) as `ppo`, with no
-condition-specific exception or code-level failure anywhere. No full 10/10 `mt_ppo` run was
-achieved this session (see the OOM-rate finding immediately below) — this is a real, currently-
-unresolved gap, not a smoothed-over one.
+**mt_ppo diagnostics/rotation — confirmed identical to `ppo`, including a full clean 10/10 run.**
+Every `mt_ppo` attempt (pre- and post-fix, see below) that got past its first few steps produced
+the same shape of diagnostics (`ratio_mean`/`clip_fraction` present, checkpoint saves at the
+expected steps) as `ppo`, with no condition-specific exception or code-level failure anywhere.
+After the `torch.cuda.empty_cache()` fix (commit `65e082d`, see below) landed, a full `mt_ppo`
+10/10 run succeeded on the first attempt: checkpoint rotation correct (`checkpoint-3` deleted,
+`checkpoint-6`/`9`/`10` present), `ratio_mean`/`clip_fraction` present in all 10
+`train_log.jsonl` lines.
 
-### Real finding: OOM rate observed this session was much worse than Task 1's probe, and is worth the user's attention before launching the full 500-step run
+### Real finding: OOM rate observed this session was much worse than Task 1's probe — since root-caused and fixed (commit `65e082d`)
+
+**Status: resolved.** The finding below (6/7 failures, ~86%) was real, live data from this
+session and is kept in full for the record — it's a genuine, valuable measurement of this GPU's
+actual operating margin under this workload, not a stale or superseded concern. It has since led
+to a real fix, not just a documented risk: commit `65e082d` ("Fix checkpoint-save-boundary CUDA
+OOM in MTPPOTrainer") adds a single `torch.cuda.empty_cache()` call in `_save_full_checkpoint`,
+immediately before `_save_optimizer_and_scheduler` — freeing cached-but-unused GPU blocks to give
+`torch.save`'s internal serialization of GPU-resident AdamW optimizer state the working headroom
+it needs at this workload's high (~92-94%) GPU utilization. **Re-verified directly**: with the
+fix in place, `mt_ppo`'s Step 6 regression check (the same command that had failed 4/4 times
+pre-fix) succeeded on its very first post-fix attempt — full 10/10 steps, correct checkpoint
+rotation, all diagnostics present. Only one post-fix attempt was needed (the plan allowed up to
+2), so no data exists yet on whether the fix's benefit holds up over more attempts/a longer run —
+treat "resolved" here as "confirmed to help, re-tested once, real" rather than "guaranteed zero
+future OOM risk over 500 steps." The recommendation below (lower `save_steps`, active
+babysitting for the eventual full run) is still worth keeping as a belt-and-suspenders posture
+even with the fix in place, precisely because it's only been re-verified once.
 
 Task 1's wall-clock probe (`docs/superpowers/probes/2026-07-23-phase-7b-wallclock-probe.md`,
 `--max-steps 15`) measured `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` cutting the OOM rate
@@ -187,3 +206,19 @@ treated as needing active babysitting/auto-resume (`--resume-from-checkpoint aut
 fire-and-forget background job. Consider a lower `save_steps` (e.g. 10-15) for the full run
 specifically to bound the blast radius of the next OOM, which — per this session's data — should
 be expected, not treated as a rare edge case.
+
+**One honest caveat on the fix's stated causal mechanism, worth recording rather than smoothing
+over**: this session's own captured tracebacks (all 6 failures) never actually show
+`_save_optimizer_and_scheduler`, `torch.save`, or any checkpoint-saving code in the stack — every
+failure occurred during ordinary forward/backward compute (`_forward_critic_values`, attention,
+MLP, or a `fla` Triton backward kernel), not inside a save call itself. The fix's commit message
+frames the root cause as OOMs landing "at or immediately after a checkpoint-save step boundary,"
+which is a looser fit to the raw data than it reads (e.g. `ppo`'s attempt-1 OOM was at step 9, one
+step short of the step-9 save; `mt_ppo`'s attempt-4 OOM was at step 7, one step past the step-6
+save). This doesn't make the fix wrong or useless — `torch.cuda.empty_cache()` freeing
+fragmented-but-unused blocks is a generically reasonable thing to do at a natural pause point
+regardless of exactly which subsequent step trips over the resulting headroom, and the re-test
+above is real, direct evidence it helped on this run. But the specific "boundary-triggered" causal
+story should be treated as a plausible contributing hypothesis validated by one successful re-run,
+not a fully nailed-down root cause — worth another data point or two before treating it as
+settled science.
