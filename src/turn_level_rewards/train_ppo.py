@@ -11,6 +11,7 @@ import argparse
 import inspect
 import itertools
 import json
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,6 +39,107 @@ Condition = Literal["ppo", "mt_ppo"]
 MODEL_NAME = "Qwen/Qwen3.5-0.8B"
 
 _SAMPLE_COMPLETION_INTERVAL = 10
+
+_DEAD_REWARD_STEP_THRESHOLD = 20
+_FORMAT_COLLAPSE_STREAK_THRESHOLD = 20
+
+
+@dataclass
+class _CollapseAlert:
+    title: str
+    text: str
+    level: str  # "ERROR" or "WARN"
+    should_stop: bool = False
+
+
+class CollapseMonitor:
+    """Pure, testable collapse-visibility state machine for MTPPOTrainer.train()'s per-step loop.
+
+    Mirrors train.py's TrackioAlertCallback pattern (non-finite loss stops training; reward
+    stuck at 0 for too long is a dead-signal alert) but adapted for PPO -- there is no
+    frac_reward_zero_std here (a GRPO group-relative-advantage concept this trainer has no
+    equivalent of), and a new format-compliance-collapse check is added instead: the paper's own
+    PPO-OR baselines are documented as prone to crashing (arXiv:2505.11821v2 Section 6.1,
+    "PPO baselines often crash"), and this exists to make that visible live from the trackio
+    curves alone, not to auto-rollback -- see
+    docs/superpowers/specs/2026-07-23-phase-7b-full-ppo-runs-design.md's "policy collapse"
+    decision for why an automated rollback would be inventing a mechanism the paper never
+    describes.
+
+    Returns _CollapseAlert instances instead of calling trackio.alert directly, so this class is
+    unit-testable without a live trackio backend -- trackio.alert itself is the external seam,
+    kept in train()'s caller (cosmicpython dependency-inversion, same principle CLAUDE.md's
+    Guiding principles section already applies throughout this repo).
+    """
+
+    def __init__(self) -> None:
+        self._reward_ever_nonzero = False
+        self._dead_reward_alerted = False
+        self._format_ever_compliant = False
+        self._format_collapse_streak = 0
+        self._format_collapse_alerted = False
+
+    def check(
+        self, step: int, loss: float, mean_reward: float, mean_format_reward: float
+    ) -> list[_CollapseAlert]:
+        if not math.isfinite(loss):
+            return [
+                _CollapseAlert(
+                    title="Non-finite loss",
+                    text=f"Loss is {loss} at step {step} -- stopping training.",
+                    level="ERROR",
+                    should_stop=True,
+                )
+            ]
+
+        alerts: list[_CollapseAlert] = []
+
+        if mean_reward != 0.0:
+            self._reward_ever_nonzero = True
+        if (
+            not self._reward_ever_nonzero
+            and not self._dead_reward_alerted
+            and step >= _DEAD_REWARD_STEP_THRESHOLD
+        ):
+            alerts.append(
+                _CollapseAlert(
+                    title="Dead reward",
+                    text=(
+                        f"Reward has been exactly 0.0 for all {step + 1} steps so far -- "
+                        "possible miswired reward function, tool-calling loop, or policy "
+                        "collapse."
+                    ),
+                    level="ERROR",
+                )
+            )
+            self._dead_reward_alerted = True
+
+        if mean_format_reward > 0.0:
+            self._format_ever_compliant = True
+            self._format_collapse_streak = 0
+            self._format_collapse_alerted = False
+        elif self._format_ever_compliant:
+            self._format_collapse_streak += 1
+            if (
+                self._format_collapse_streak >= _FORMAT_COLLAPSE_STREAK_THRESHOLD
+                and not self._format_collapse_alerted
+            ):
+                alerts.append(
+                    _CollapseAlert(
+                        title="Format compliance collapsed",
+                        text=(
+                            f"format_reward has been non-positive for "
+                            f"{self._format_collapse_streak} consecutive steps after previously "
+                            "being compliant -- likely policy collapse (matches the paper's own "
+                            "documented PPO-OR instability). Check trackio curves and consider "
+                            "evaluating an earlier checkpoint."
+                        ),
+                        level="WARN",
+                    )
+                )
+                self._format_collapse_alerted = True
+
+        return alerts
 
 
 @dataclass
@@ -828,6 +930,7 @@ class MTPPOTrainer(Trainer):
         in _rollout_episode uses torch's global RNG).
         """
         set_seed(self.args.seed)
+        collapse_monitor = CollapseMonitor()
         self.optimizer = self.create_optimizer()
         # self.train_dataset is typed by Trainer's base class as
         # `torch.utils.data.Dataset | datasets.arrow_dataset.Dataset | None`, and
@@ -880,6 +983,30 @@ class MTPPOTrainer(Trainer):
                 "retrieval_fraction": mean_retrieval_fraction,
             }
             trackio.log(metrics)
+
+            mean_format_reward = sum(e["format_reward"] for e in episodes) / len(episodes)
+            for alert in collapse_monitor.check(
+                step=step,
+                loss=metrics["loss"],
+                mean_reward=mean_reward,
+                mean_format_reward=mean_format_reward,
+            ):
+                trackio.alert(
+                    title=alert.title,
+                    text=alert.text,
+                    level=trackio.AlertLevel.ERROR
+                    if alert.level == "ERROR"
+                    else trackio.AlertLevel.WARN,
+                )
+                if alert.should_stop:
+                    # _save_full_checkpoint doesn't exist yet -- it's added by Task 5
+                    # (checkpoint-resume), which lands after this task. Intentional forward
+                    # reference (see this task's brief); not exercised by any unit test today.
+                    self._save_full_checkpoint(  # ty: ignore[unresolved-attribute]
+                        f"{self.args.output_dir}/checkpoint-{step + 1}"
+                    )
+                    print(f"Stopping training early at step {step + 1}: {alert.title}", flush=True)
+                    return
 
             log_record = dict(metrics)
             log_record["step_elapsed_seconds"] = time.monotonic() - step_start

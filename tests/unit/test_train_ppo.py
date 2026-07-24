@@ -9,6 +9,7 @@ import pytest
 import torch
 import torch.nn as nn
 from turn_level_rewards.train_ppo import (
+    CollapseMonitor,
     MTPPOTrainer,
     _final_retrieval_fraction,
     _parse_args,
@@ -380,3 +381,73 @@ def test_final_retrieval_fraction_returns_zero_for_no_turns():
 def test_final_retrieval_fraction_returns_last_value():
     rollout = {"retrieval_fraction_after_each_turn": [0.5, 1.0]}
     assert _final_retrieval_fraction(rollout) == 1.0
+
+
+def test_collapse_monitor_stops_on_non_finite_loss():
+    monitor = CollapseMonitor()
+
+    alerts = monitor.check(step=5, loss=float("nan"), mean_reward=1.0, mean_format_reward=0.1)
+
+    assert len(alerts) == 1
+    assert alerts[0].should_stop is True
+    assert alerts[0].level == "ERROR"
+
+
+def test_collapse_monitor_no_alerts_for_healthy_run():
+    monitor = CollapseMonitor()
+
+    for step in range(30):
+        alerts = monitor.check(step=step, loss=0.5, mean_reward=1.0, mean_format_reward=0.1)
+        assert alerts == []
+
+
+def test_collapse_monitor_fires_dead_reward_alert_after_threshold():
+    """The alert fires exactly once, part-way through this loop (once step reaches the
+    threshold), then stays suppressed for the remaining iterations (see
+    test_collapse_monitor_each_alert_fires_only_once) -- so alerts must be accumulated across
+    the whole loop, not read off only the final iteration's return value, which would always be
+    empty by the fire-once design.
+    """
+    monitor = CollapseMonitor()
+
+    fired: list = []
+    for step in range(25):
+        fired.extend(monitor.check(step=step, loss=0.5, mean_reward=0.0, mean_format_reward=0.1))
+
+    assert len(fired) == 1
+    assert fired[0].should_stop is False
+    assert "Dead reward" in fired[0].title
+
+
+def test_collapse_monitor_fires_format_collapse_alert_after_regression():
+    """format_reward is healthy for the first 10 steps, then craters and stays there -- should
+    alert once it's been non-positive for enough consecutive steps, but only because it
+    regressed FROM a compliant state (this is a collapse signal, not a "never learned" signal,
+    which test_collapse_monitor_fires_dead_reward_alert_after_threshold already covers).
+    """
+    monitor = CollapseMonitor()
+
+    for step in range(10):
+        alerts = monitor.check(step=step, loss=0.5, mean_reward=1.0, mean_format_reward=0.1)
+        assert alerts == []
+
+    # Accumulated across the loop, not read off only the final iteration -- see the analogous
+    # note on test_collapse_monitor_fires_dead_reward_alert_after_threshold above; the alert
+    # fires part-way through this range and is then suppressed for the rest of it.
+    fired: list = []
+    for step in range(10, 35):
+        fired.extend(monitor.check(step=step, loss=0.5, mean_reward=-0.1, mean_format_reward=-0.1))
+
+    assert len(fired) == 1
+    assert "Format compliance" in fired[0].title
+    assert fired[0].should_stop is False
+
+
+def test_collapse_monitor_each_alert_fires_only_once():
+    monitor = CollapseMonitor()
+
+    for step in range(25):
+        monitor.check(step=step, loss=0.5, mean_reward=0.0, mean_format_reward=0.1)
+
+    more_alerts = monitor.check(step=25, loss=0.5, mean_reward=0.0, mean_format_reward=0.1)
+    assert more_alerts == []
