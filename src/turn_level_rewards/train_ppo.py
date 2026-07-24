@@ -28,6 +28,7 @@ from transformers import (
     PreTrainedModel,
     Trainer,
     TrainingArguments,
+    get_constant_schedule,
 )
 from transformers.trainer_callback import TrainerState
 from transformers.trainer_utils import get_last_checkpoint, rotate_checkpoints, set_seed
@@ -436,7 +437,21 @@ class MTPPOTrainer(Trainer):
     # is only reached for FSDP-XLA, SageMaker MP-DP, or DataParallel; this repo's single-GPU
     # setup (per CLAUDE.md's Hardware section) never triggers it, so the omission is safe.
     def create_optimizer(self) -> torch.optim.Optimizer:  # ty: ignore[invalid-method-override]
-        """One AdamW, two param groups -- policy_lr / critic_lr per the paper's spec (10x apart)."""
+        """One AdamW, two param groups -- policy_lr / critic_lr per the paper's spec (10x apart).
+
+        Also sets self.lr_scheduler to a no-op constant schedule (this trainer never decays either
+        learning rate -- the paper's own spec fixes policy_lr/critic_lr for the run's duration).
+        This is load-bearing, not cosmetic: a real bug found while verifying Task 5's
+        checkpoint-resume fix -- transformers.Trainer.__init__ initializes self.lr_scheduler to
+        None, and train() never otherwise assigns it, so Trainer's own inherited
+        _save_optimizer_and_scheduler/_load_optimizer_and_scheduler (used by
+        _save_full_checkpoint/_load_full_checkpoint) unconditionally call
+        self.lr_scheduler.state_dict()/.load_state_dict() -- a real crash on the very first
+        checkpoint save, `AttributeError: 'NoneType' object has no attribute 'state_dict'`,
+        confirmed by direct reproduction. get_constant_schedule's LambdaLR holds only a reference
+        to the optimizer plus a step counter (no per-parameter tensor state), so unlike the
+        optimizer itself, there is no analogous orphaned-reference risk here across a resume.
+        """
         # self.model.policy, self.model.critic, self.args.policy_lr, and self.args.critic_lr
         # are all real attributes defined on this file's _PolicyAndCritic and MTPPOConfig
         # classes respectively. They are safe; ty's inability to see through Trainer's looser
@@ -447,6 +462,7 @@ class MTPPOTrainer(Trainer):
                 {"params": self.model.critic.parameters(), "lr": self.args.critic_lr},  # ty: ignore[unresolved-attribute]
             ]
         )
+        self.lr_scheduler = get_constant_schedule(self.optimizer)
         return self.optimizer
 
     def _rollout_episode(self, row: dict) -> dict:
@@ -958,27 +974,35 @@ class MTPPOTrainer(Trainer):
         state, and global_step, so train() can resume exactly where a prior run left off. Not
         unit-tested: loads real weights and real optimizer/RNG state from disk -- validated by
         Task 7's live smoke test instead, same convention as build_policy_and_critic.
+
+        Loads weights INTO the existing self.model.policy/self.model.critic objects via
+        load_state_dict, rather than replacing those objects outright -- a real bug a code
+        reviewer caught: train() calls self.optimizer = self.create_optimizer() (which binds
+        AdamW's param groups to the *specific tensor objects* of
+        self.model.policy.parameters()/self.model.critic.parameters() at that moment) BEFORE this
+        method runs. Reassigning self.model.policy/.critic to brand-new model objects loaded from
+        the checkpoint would silently orphan the optimizer's param-group references -- forward/
+        backward would then populate .grad on the NEW model's parameters, but optimizer.step()
+        would only ever update the old, now-untethered tensors nothing else reads from. No
+        exception, just a resumed run that silently stops learning. load_state_dict instead
+        copies the checkpoint's tensor values into the existing parameter tensors in place, so the
+        optimizer's existing references stay valid -- no reordering relative to create_optimizer()
+        is needed, and no rebuilding of gradient_checkpointing_enable() either (already enabled on
+        the existing self.model.policy/.critic by build_policy_and_critic).
         """
-        # self.model.policy.device is a real torch.device at runtime (see create_optimizer's
-        # comment for why ty can't see this through Trainer's loose self.model type). Its type is
-        # therefore Unknown to ty, which makes the immediately-following AutoModelForCausalLM
-        # .to(device) call below resolve against the wrong overload of nn.Module.to() and
-        # misreport its argument type -- safe: policy is a real PreTrainedModel instance and
-        # device is a real torch.device at runtime.
-        device = self.model.policy.device  # ty: ignore[unresolved-attribute]
-        policy = AutoModelForCausalLM.from_pretrained(
+        policy_checkpoint = AutoModelForCausalLM.from_pretrained(
             str(Path(checkpoint_dir) / "policy"), dtype=torch.bfloat16
-        ).to(device)  # ty: ignore[invalid-argument-type]
-        critic = AutoModelForSequenceClassification.from_pretrained(
+        )
+        critic_checkpoint = AutoModelForSequenceClassification.from_pretrained(
             str(Path(checkpoint_dir) / "critic"), num_labels=1, dtype=torch.bfloat16
-        ).to(device)
-        policy.gradient_checkpointing_enable()
-        critic.gradient_checkpointing_enable()
-        # self.model.policy/.critic are real, settable attributes of this file's _PolicyAndCritic
-        # at runtime (see create_optimizer's comment for the same root cause: ty only knows
-        # self.model as Trainer's loose base-class type, which has no `policy`/`critic` fields).
-        self.model.policy = policy  # ty: ignore[invalid-assignment]
-        self.model.critic = critic  # ty: ignore[invalid-assignment]
+        )
+        # self.model.policy/.critic are real PreTrainedModel instances at runtime (see
+        # create_optimizer's comment for why ty can't see this through Trainer's loose self.model
+        # type), each with a genuine .load_state_dict() that copies tensor values in place
+        # (handling any cross-device copy automatically), leaving the parameter objects
+        # themselves -- and every other reference to them, including the optimizer's -- intact.
+        self.model.policy.load_state_dict(policy_checkpoint.state_dict())  # ty: ignore[unresolved-attribute]
+        self.model.critic.load_state_dict(critic_checkpoint.state_dict())  # ty: ignore[unresolved-attribute]
         self._load_optimizer_and_scheduler(checkpoint_dir)
         self._load_rng_state(checkpoint_dir)
         self.state = TrainerState.load_from_json(str(Path(checkpoint_dir) / "trainer_state.json"))
@@ -1091,6 +1115,12 @@ class MTPPOTrainer(Trainer):
                     else trackio.AlertLevel.WARN,
                 )
                 if alert.should_stop:
+                    # Set global_step before saving -- this branch runs before the loop's own
+                    # `self.state.global_step = step + 1` line below, so without this, the saved
+                    # trainer_state.json would record a stale (one-step-behind) global_step,
+                    # off by one from this checkpoint directory's own `checkpoint-{step + 1}`
+                    # name.
+                    self.state.global_step = step + 1
                     self._save_full_checkpoint(f"{self.args.output_dir}/checkpoint-{step + 1}")
                     print(f"Stopping training early at step {step + 1}: {alert.title}", flush=True)
                     return
