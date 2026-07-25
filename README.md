@@ -40,7 +40,7 @@ flowchart LR
 ## Reward approaches explored
 
 GRPO's baseline design can't use an intermediate signal even if you hand it one. It computes one
-advantage per trajectory (Eq. 4 in the paper) and applies that identical value to every token in
+advantage per trajectory and applies that identical value to every token in
 every turn. A sharp search followed by a garbled answer, and a lazy search followed by a lucky
 guess, get scored no differently turn-by-turn. GRPO simply can't isolate which turn actually
 earned the credit.
@@ -415,6 +415,24 @@ The bare invocation above (no extra flags) runs at smoke-test scale: 8 rows, 2 s
 `--max-steps`, `--num-generations`, etc. explicitly for a full-scale run. Both conditions
 log to the same [trackio](https://github.com/gradio-app/trackio) project
 (`turn-level-rewards`). Run `trackio show --project turn-level-rewards` to view.
+
+## Citation
+
+If you use this repo or build on its experiments, please cite the paper it is based on:
+
+> Quan Wei, Siliang Zeng, Chenliang Li, William Brown, Oana Frunza, Wei Deng, Anderson Schneider, Yuriy Nevmyvaka, Yang Katie Zhao, Alfredo Garcia, and Mingyi Hong. *Reinforcing Multi-Turn Reasoning in LLM Agents via Turn-Level Reward Design.* arXiv:2505.11821, 2025. [https://arxiv.org/abs/2505.11821](https://arxiv.org/abs/2505.11821)
+
+```bibtex
+@misc{wei2025reinforcingmultiturnreasoningllm,
+  title={Reinforcing Multi-Turn Reasoning in LLM Agents via Turn-Level Reward Design},
+  author={Quan Wei and Siliang Zeng and Chenliang Li and William Brown and Oana Frunza and Wei Deng and Anderson Schneider and Yuriy Nevmyvaka and Yang Katie Zhao and Alfredo Garcia and Mingyi Hong},
+  year={2025},
+  eprint={2505.11821},
+  archivePrefix={arXiv},
+  primaryClass={cs.LG},
+  url={https://arxiv.org/abs/2505.11821},
+}
+```
 
 ## Contributing
 
