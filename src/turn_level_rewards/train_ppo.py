@@ -718,20 +718,19 @@ class MTPPOTrainer(Trainer):
                     )
                     continue
 
-                # Step 2: check the extracted arguments would bind against search()'s real
-                # signature WITHOUT calling it -- inspect.signature(...).bind() only performs
-                # Python's argument-binding logic (matching names/arity), it never executes
-                # search()'s body. A TypeError here (e.g. an unexpected keyword argument) is
-                # therefore guaranteed to be a real argument-mismatch caused by the model, not
-                # something that happened inside search().
-                try:
-                    inspect.signature(environment.search).bind(**call_args)
-                except TypeError as exc:
+                # Step 2: check the extracted arguments are a valid call to search() WITHOUT
+                # calling it -- names/arity via inspect binding, plus types against search()'s
+                # annotations. Neither check ever executes search()'s body, so anything caught
+                # here is guaranteed to be a model-produced argument mistake rather than
+                # something that happened inside search(). See validate_tool_call_arguments for
+                # why the type half is not optional.
+                argument_error = validate_tool_call_arguments(environment.search, call_args)
+                if argument_error is not None:
                     messages.append(
                         {
                             "role": "tool",
                             "name": "search",
-                            "content": f"Error: invalid arguments for search(): {exc}",
+                            "content": f"Error: {argument_error}",
                         }
                     )
                     continue
@@ -1408,6 +1407,44 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "latest checkpoint under this run's output_dir.",
     )
     return parser.parse_args(argv)
+
+
+def validate_tool_call_arguments(tool, call_args: dict) -> str | None:
+    """Return an error message if call_args is not a valid call to `tool`, else None.
+
+    Checks names/arity via inspect binding AND argument types against the tool's annotations.
+    The type half is what a plain bind() misses, and it is load-bearing: Python does not enforce
+    annotations, so `search(query=123)` binds perfectly happily and only fails later, out at the
+    retrieval server, as `HTTP 422 Unprocessable Content` -- which took down a 500-step run at
+    step 166 on 2026-07-24. The policy had emitted a non-string query, which the chat template's
+    json value parser (allow_non_json) faithfully passed through as an int.
+
+    A wrongly-TYPED argument is the same class of model mistake as a wrongly-NAMED one -- exactly
+    the kind of thing the episode's own format/outcome reward should teach the policy out of --
+    so it belongs here, returned as feedback to the model, rather than propagating as a crash.
+    That keeps _rollout_episode's deliberate split intact: everything raised from inside search()
+    itself still surfaces as a real infra failure and is never swallowed.
+
+    Only simple type annotations are enforced. A parameter annotated with anything else (or not
+    annotated at all) is left alone rather than guessed at -- a validator that rejects calls the
+    server would have served fine is worse than no validator.
+    """
+    try:
+        bound = inspect.signature(tool).bind(**call_args)
+    except TypeError as exc:
+        return f"invalid arguments for {tool.__name__}(): {exc}"
+
+    parameters = inspect.signature(tool).parameters
+    for name, value in bound.arguments.items():
+        annotation = parameters[name].annotation
+        if not isinstance(annotation, type) or annotation is inspect.Parameter.empty:
+            continue
+        if not isinstance(value, annotation):
+            return (
+                f"invalid arguments for {tool.__name__}(): argument '{name}' must be "
+                f"{annotation.__name__}, got {type(value).__name__} ({value!r})"
+            )
+    return None
 
 
 def resolve_auto_checkpoint(output_dir: str | None) -> str:

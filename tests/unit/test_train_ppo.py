@@ -22,6 +22,7 @@ from turn_level_rewards.train_ppo import (
     resolve_auto_checkpoint,
     resolve_stop_token_ids,
     truncate_after_stop_token,
+    validate_tool_call_arguments,
 )
 
 
@@ -613,3 +614,44 @@ def test_resolve_auto_checkpoint_raises_a_clear_error_on_a_missing_output_dir(tm
 def test_resolve_auto_checkpoint_raises_on_an_existing_but_empty_output_dir(tmp_path):
     with pytest.raises(ValueError, match="no checkpoint found"):
         resolve_auto_checkpoint(str(tmp_path))
+
+
+def _search(query: str, topk: int = 3) -> str:
+    """Stand-in with the same annotation shape as SearchEnv.search."""
+    return ""
+
+
+def test_validate_tool_call_arguments_accepts_a_well_formed_call():
+    assert validate_tool_call_arguments(_search, {"query": "who is X"}) is None
+    assert validate_tool_call_arguments(_search, {"query": "x", "topk": 5}) is None
+
+
+def test_validate_tool_call_arguments_rejects_a_non_string_query():
+    """The 2026-07-24 crash: the policy emitted a numeric/null query, which bind() accepts
+    (Python does not enforce annotations) and the retrieval server then rejected with HTTP 422,
+    taking the whole run down at step 166.
+
+    A wrongly-TYPED argument is the same class of model mistake as a wrongly-NAMED one, so it
+    has to be caught here and fed back to the policy, not raised out of search().
+    """
+    assert "query" in (validate_tool_call_arguments(_search, {"query": 123}) or "")
+    assert "query" in (validate_tool_call_arguments(_search, {"query": None}) or "")
+
+
+def test_validate_tool_call_arguments_rejects_unknown_and_missing_arguments():
+    assert validate_tool_call_arguments(_search, {"return": "x"}) is not None
+    assert validate_tool_call_arguments(_search, {}) is not None
+
+
+def test_validate_tool_call_arguments_allows_a_bool_where_int_is_annotated():
+    """bool is a subclass of int, so isinstance already accepts it -- pinned so a future
+    tightening does not start rejecting calls the retrieval server would have served fine.
+    """
+    assert validate_tool_call_arguments(_search, {"query": "x", "topk": True}) is None
+
+
+def test_validate_tool_call_arguments_ignores_parameters_without_a_simple_annotation():
+    def tool(payload, flag: str = "a"):
+        return ""
+
+    assert validate_tool_call_arguments(tool, {"payload": {"anything": 1}}) is None
