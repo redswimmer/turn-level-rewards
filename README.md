@@ -14,7 +14,7 @@ holds up at a much smaller scale.
 Inspired by ["Reinforcing Multi-Turn Reasoning in LLM Agents via Turn-Level Reward
 Design"](https://arxiv.org/abs/2505.11821) (arXiv:2505.11821), specifically its GRPO and PPO case
 study, though not a strict reproduction. Biggest differences: a much smaller model on a single consumer GPU
-(`Qwen3.5-0.8B` on an RTX 4090, vs. the paper's `Qwen2.5-7B`) and a different dataset (HotpotQA
+(`Qwen3.5-0.8B` on a single NVIDIA RTX 4090, vs. the paper's `Qwen2.5-7B` on 8 NVIDIA H100s) and a different dataset (HotpotQA
 vs. TriviaQA, picked for genuinely multi-hop questions). Smaller deviations are noted inline below.
 
 ## The agent
