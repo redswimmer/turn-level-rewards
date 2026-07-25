@@ -18,6 +18,7 @@ from turn_level_rewards.train_ppo import (
     build_ppo_config,
     compute_gae,
     compute_ppo_loss,
+    gather_action_logprobs,
     place_turn_rewards,
     resolve_auto_checkpoint,
     resolve_stop_token_ids,
@@ -655,3 +656,71 @@ def test_validate_tool_call_arguments_ignores_parameters_without_a_simple_annota
         return ""
 
     assert validate_tool_call_arguments(tool, {"payload": {"anything": 1}}) is None
+
+
+def _logprob_fixture(num_positions: int, vocab: int = 64, hidden: int = 8):
+    """Small float32 CPU stand-in for the policy's lm_head + selected hidden states."""
+    torch.manual_seed(0)
+    lm_head = nn.Linear(hidden, vocab, bias=False)
+    states = torch.randn(num_positions, hidden, requires_grad=True)
+    targets = torch.randint(0, vocab, (num_positions,))
+    return lm_head, states, targets
+
+
+def _unchunked_reference(lm_head, states, targets):
+    """What _forward_policy_logprobs computed before chunking: one [n, vocab] tensor."""
+    log_probs = torch.log_softmax(lm_head(states), dim=-1)
+    return log_probs.gather(1, targets.unsqueeze(-1)).squeeze(-1)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 4, 16, 1000])
+def test_gather_action_logprobs_matches_the_unchunked_computation(chunk_size):
+    """Chunking is a memory optimisation, so it must not change the numbers meaningfully.
+
+    Each position's log_softmax is over its own vocab row and is mathematically independent of
+    every other position. The agreement is not bit-exact, though, and the first version of this
+    test wrongly asserted torch.equal: a [chunk, hidden] x [hidden, vocab] matmul can select a
+    different GEMM kernel than the full-height one, so lm_head's own output moves by about one
+    ULP (measured: 4.77e-07 in float32, and exactly 0 when chunk_size covers every position).
+    Tolerance is set just above that, tight enough that any real algorithmic change fails.
+    """
+    lm_head, states, targets = _logprob_fixture(10)
+    expected = _unchunked_reference(lm_head, states, targets)
+
+    actual = gather_action_logprobs(lm_head, states, targets, chunk_size=chunk_size)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=0)
+
+
+def test_gather_action_logprobs_produces_identical_gradients():
+    """The value being right is not enough -- this sits inside a backward pass, so the gradient
+    it feeds to the policy has to match too.
+    """
+    lm_head, states, targets = _logprob_fixture(10)
+    _unchunked_reference(lm_head, states, targets).sum().backward()
+    assert states.grad is not None
+    expected_grad = states.grad.clone()
+
+    states.grad = None
+    gather_action_logprobs(lm_head, states, targets, chunk_size=3).sum().backward()
+    actual_grad = states.grad
+
+    assert actual_grad is not None
+    assert torch.allclose(actual_grad, expected_grad, atol=1e-6)
+
+
+def test_gather_action_logprobs_handles_a_single_action_token():
+    lm_head, states, targets = _logprob_fixture(1)
+
+    actual = gather_action_logprobs(lm_head, states, targets, chunk_size=256)
+
+    assert actual.shape == (1,)
+    assert torch.allclose(actual, _unchunked_reference(lm_head, states, targets), atol=1e-6)
+
+
+def test_gather_action_logprobs_rejects_a_non_positive_chunk_size():
+    """A chunk_size of 0 would loop forever building empty chunks -- fail loudly instead."""
+    lm_head, states, targets = _logprob_fixture(4)
+
+    with pytest.raises(ValueError, match="chunk_size"):
+        gather_action_logprobs(lm_head, states, targets, chunk_size=0)

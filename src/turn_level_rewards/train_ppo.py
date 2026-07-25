@@ -23,6 +23,7 @@ from typing import Literal
 import torch
 import torch.nn as nn
 import trackio
+from torch.utils.checkpoint import checkpoint
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
@@ -43,6 +44,10 @@ Condition = Literal["ppo", "mt_ppo"]
 MODEL_NAME = "Qwen/Qwen3.5-0.8B"
 
 _SAMPLE_COMPLETION_INTERVAL = 10
+
+# Positions per gradient-checkpointed lm_head chunk. Memory-only knob: it changes peak
+# memory, never the numbers. See gather_action_logprobs for the measurements behind 256.
+LOGPROB_CHUNK_SIZE = 256
 
 _DEAD_REWARD_STEP_THRESHOLD = 20
 _FORMAT_COLLAPSE_STREAK_THRESHOLD = 20
@@ -820,10 +825,15 @@ class MTPPOTrainer(Trainer):
         # `.lm_head` (the vocab projection) are both real, always-callable submodules.
         policy_hidden = self.model.policy.model(input_ids=input_ids).last_hidden_state[0]  # ty: ignore[call-non-callable, unresolved-attribute]  # [seq_len, hidden]
         selected_hidden = policy_hidden[predict_positions]  # [num_action_tokens, hidden]
-        selected_logits = self.model.policy.lm_head(selected_hidden)  # ty: ignore[call-non-callable, unresolved-attribute]  # [num_action_tokens, vocab]
-        log_probs = torch.log_softmax(selected_logits, dim=-1)
         next_tokens = input_ids[0, action_indices]
-        return log_probs.gather(1, next_tokens.unsqueeze(-1)).squeeze(-1)
+        # Chunked rather than one [num_action_tokens, vocab] pass: identical numbers, but a peak
+        # that no longer grows with episode length. See gather_action_logprobs for the measured
+        # sizes and for why this was the term behind mt_ppo's 13.8% OOM step-skip rate.
+        return gather_action_logprobs(
+            self.model.policy.lm_head,  # ty: ignore[unresolved-attribute]
+            selected_hidden,
+            next_tokens,
+        )
 
     def _forward_critic_values(
         self, full_token_ids: list[int], action_mask: list[int]
@@ -1407,6 +1417,66 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "latest checkpoint under this run's output_dir.",
     )
     return parser.parse_args(argv)
+
+
+def gather_action_logprobs(lm_head, hidden_states, next_tokens, chunk_size=LOGPROB_CHUNK_SIZE):
+    """Log-prob of each next_token, applying lm_head in gradient-checkpointed chunks.
+
+    Purely a memory optimisation -- mathematically this is just
+    `log_softmax(lm_head(hidden_states)).gather(...)`, since each position's log_softmax is taken
+    over its own vocab row and is independent of every other position.
+
+    Agreement is numerical, not bit-exact, and the distinction is worth stating precisely: a
+    [chunk, hidden] x [hidden, vocab] matmul can select a different GEMM kernel than the
+    full-height one, so lm_head's output shifts by roughly one ULP (measured: 4.77e-07 in
+    float32; exactly 0 when one chunk covers every position; ~1e-3 relative in bf16, the same
+    caveat Liger-Kernel documents for its own chunked kernels). tests/unit/test_train_ppo.py
+    pins values and gradients to a tolerance just above that, at chunk sizes that do and do not
+    divide the position count.
+
+    Why it is needed (measured on this repo's own RTX 4090, not assumed). Phase 7 already cut
+    the vocab-sized tensor from O(seq_len * vocab) to O(num_action_tokens * vocab) by applying
+    lm_head only at action positions. But with a 248,320-token vocab that residual term is still
+    the only part of the update that GROWS WITH EPISODE LENGTH -- and mt_ppo's episodes triple in
+    length during training (386 -> ~1190 action tokens) as its turn reward teaches the policy to
+    search more. Measured peak for this path alone:
+
+        num_action_tokens:   1200      3000
+        one pass:           2.32 GB   5.02 GB
+        chunked (256):      0.92 GB   0.94 GB      <- flat, at the lm_head-weight floor
+
+    That growth is what drove mt_ppo's 13.8% CUDA-OOM step-skip rate (69 of 500 steps, every one
+    of them inside _ppo_update, never in rollout, all peaking at 23.6-24.2 GB against a ~23.5 GB
+    card) while ppo -- whose episodes stay short -- skipped 0.2%. An asymmetric skip rate between
+    the two conditions is a methodology problem, not just lost throughput: it silently gives the
+    two arms of the comparison different numbers of real gradient updates (431 vs 499).
+
+    torch.utils.checkpoint drops each chunk's [chunk_size, vocab] logits after the forward pass
+    and recomputes them during backward, trading one extra lm_head matmul per chunk for a peak
+    that no longer depends on episode length.
+
+    Liger-Kernel's LigerFusedLinearPPOLoss was evaluated first and deliberately not used: it
+    computes the whole PPO objective (it takes advantages/old_per_token_logps/epsilon/beta and a
+    loss_type selector), so adopting it would replace this repo's paper-faithful compute_ppo_loss
+    and its clip-fraction/ratio diagnostics -- a different algorithm, not a memory optimisation.
+    """
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+    def head(states, targets):
+        log_probs = torch.log_softmax(lm_head(states), dim=-1)
+        return log_probs.gather(1, targets.unsqueeze(-1)).squeeze(-1)
+
+    chunks = [
+        checkpoint(
+            head,
+            hidden_states[start : start + chunk_size],
+            next_tokens[start : start + chunk_size],
+            use_reentrant=False,
+        )
+        for start in range(0, hidden_states.shape[0], chunk_size)
+    ]
+    return torch.cat(chunks)
 
 
 def validate_tool_call_arguments(tool, call_args: dict) -> str | None:
