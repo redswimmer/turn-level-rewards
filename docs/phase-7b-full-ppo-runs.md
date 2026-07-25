@@ -246,3 +246,116 @@ above is real, direct evidence it helped on this run. But the specific "boundary
 story should be treated as a plausible contributing hypothesis validated by one successful re-run,
 not a fully nailed-down root cause — worth another data point or two before treating it as
 settled science.
+
+## Handoff: 2026-07-24 full-runs session (mid-Task-1, stopped for handoff)
+
+**Status at handoff**: the infra plan (above) is fully done and merged. A new plan,
+`docs/superpowers/plans/2026-07-24-phase-7b-full-runs-plan.md` (design doc:
+`docs/superpowers/specs/2026-07-24-phase-7b-full-runs-design.md`), covers the actual full runs +
+evaluation + comparison + charts. **Task 1 (the full `ppo` run) is currently in progress, running
+unattended in the background** (a real nohup'd process on this machine, PID varies across
+restarts — check `ps aux | grep train_ppo`) as of this write-up: **step 133/500, latest checkpoint
+`outputs/ppo/checkpoint-120`**. It is NOT finished. Tasks 2-6 have not started.
+
+**Before doing anything else, read this whole section** — several real, non-obvious things
+happened this session that change how to interpret the run's current state and how to proceed.
+
+### What actually happened, in order
+
+1. **The first launch was silently wrong-scale.** Both the design doc's and plan's launch
+   commands omitted `--train-size`, which defaults to `8` (a smoke-test default) in
+   `train_ppo.py`'s CLI. 219 of 500 steps ran against 8 repeated rows before this was caught (via
+   `sample_completions.log` showing the same 2 questions recurring, and the live process's own
+   command line). Killed, discarded, fixed in both docs (`--train-size 90447` is now required and
+   double-checked in every launch/resume command in the plan) — see the "Real incident" section
+   above this one for the full account.
+
+2. **A deterministic OOM wall at step 19-20.** A single 2302-action-token episode (vs. typical
+   ~150-200) left the CUDA allocator fragmented enough that the next step always OOM'd — and
+   because `--resume-from-checkpoint` deterministically replays the identical data order, every
+   resume attempt walked back into the exact same wall (confirmed: three consecutive resumes died
+   with byte-identical OOM diagnostics). Fixed with `torch.cuda.empty_cache()` after every PPO
+   update, not just before checkpoint saves (commit `9c81021`).
+
+3. **A delegated implementer agent got into a runaway retry loop** — launching a new resume
+   attempt before the previous crashed process had fully released GPU memory, causing a cascade of
+   spurious immediate failures (model-load-time OOMs) layered on top of the real issue. Stopped the
+   agent entirely; the rest of this session's babysitting was done by the controller directly
+   (`nohup ... &`, `disown`, manual `ps`/`nvidia-smi` checks), not via a re-delegated subagent. If
+   resuming this run via a fresh subagent, brief it explicitly on this failure mode and require it
+   to confirm the GPU is at baseline (`nvidia-smi`, ~200-700MiB) before every launch, not just
+   check `ps aux`.
+
+4. **A second deterministic wall, right after `checkpoint-30`.** Same underlying mechanism as #2,
+   a different specific episode. This time, researched real-world practice (web search, not
+   guessed) before choosing a fix: rather than a seed-nudge workaround (no real precedent found
+   anywhere for that), adopted the standard PyTorch community pattern (catch the OOM at the
+   per-batch level, `empty_cache()`, continue to the next batch rather than crash the process) —
+   also matches veRL's own real `filter_overlong_prompts` feature (veRL underlies Search-R1, the
+   lineage this repo's own design already builds on). Implemented as: catch `RuntimeError` in
+   `train()`'s per-step loop (checking the message says "out of memory", so both
+   `torch.OutOfMemoryError` and Triton's plain-`RuntimeError` OOM are covered, while a genuinely
+   different bug still propagates as a visible crash), log the skip to `train_log.jsonl` with the
+   attempted questions, and `continue` — no process restart needed at all (commit `118b690`,
+   reviewed clean by a fresh subagent). **This is the single most important change this session
+   made**: it converts "the run crashes and needs a human/agent to notice and resume it" into "the
+   run silently self-heals and keeps going," which is what let steps 31-133 complete without any
+   further manual intervention.
+
+5. **Built `scripts/analyze_train_log.py`** (commit `60eec1c`) after being asked, correctly, not to
+   just eyeball individual skip notifications and call them "routine." Give it any
+   `train_log.jsonl` and it reports: the run's own `num_action_tokens` distribution (min/median/
+   p90/p99/max), outlier episodes (> 3x the run's own median — this is what actually found the
+   2302-token episode, and would find future ones without needing to already know what "normal"
+   looks like), every OOM-skipped step with its attempted questions, and skip rate by 20-step
+   window (to tell a clustered rough patch from a persistent problem). **Use this first** when
+   picking this run back up, before eyeballing raw logs.
+
+6. **Confirmed, with real data, that the memory margin is not a leak.** Parsed the "X GiB
+   allocated" figure out of every skip's own exception message across steps 30-91: **22.83-23.23
+   GiB, consistently, no growth trend.** This is a persistently tight (~94-95% of the 23.51GB
+   card) operating margin that was present from early in the run, not something that got worse
+   over time. The skip rate (40% in steps 40-59, 10% in steps 60-79, 20% in steps 80-99) is noisy
+   around this stable-but-tight baseline, not a clean monotonic decline — an earlier version of
+   this write-up overclaimed "declining trend, self-correcting"; that was premature. The
+   mechanistic story (untrained early-policy rambling to the per-turn `max_completion_length=2048`
+   cap without producing a valid answer, confirmed directly against one real episode's own
+   `retrieval_fraction=0.5`/`format_and_outcome_reward=-0.1` record) is still plausible and still
+   the best explanation for the *outlier-length* episodes specifically, but it does not fully
+   explain why the *baseline* margin is this tight throughout — that remains an open question, not
+   a solved one.
+
+7. **Added real per-step GPU memory instrumentation** (commit `b8ce2a4`), in direct response to
+   being told, correctly, to stop reconstructing memory state from exception-message text after
+   the fact. Every step (success or skip) now logs `gpu_allocated_gb`/`gpu_reserved_gb`/
+   `gpu_max_allocated_gb` (peak since a reset at the top of that same step, so it's this step's own
+   peak, not a running max) to `trackio`/`train_log.jsonl`. Skip records also now carry
+   `failed_at`: `"_collect_batch"` or `"_ppo_update"`, so a future incident doesn't need to guess
+   which of the two GPU-heavy calls actually raised the exception.
+   **Important**: this instrumentation does NOT apply to the currently-running process (Python
+   doesn't hot-reload) — it only takes effect on the next launch or resume. The steps already
+   logged (0-133 as of this write-up) do not have these three new fields.
+
+### What to do next
+
+1. **Check on the run**: `ps aux | grep train_ppo` (is it still alive?), then
+   `uv run python scripts/analyze_train_log.py outputs/ppo/train_log.jsonl` (skip rate trend, any
+   new outlier pattern). If the process died and isn't running, resume it:
+   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m turn_level_rewards.train_ppo --condition ppo --train-size 90447 --max-steps 500 --num-rollouts-per-step 2 --save-steps 15 --seed 42 --resume-from-checkpoint auto`
+   — confirm GPU is at baseline (`nvidia-smi`, ~200-700MiB) before launching, per the runaway-loop
+   lesson in point 3 above.
+2. **Once `ppo` reaches step 500**: check whether `CollapseMonitor` fired any alerts and whether
+   `checkpoint-500` or an earlier checkpoint should be used for evaluation (the paper's own
+   methodology — see the design doc). Then launch Task 2 (`mt_ppo`, identical command with
+   `--condition mt_ppo`), which will now benefit from the GPU memory instrumentation and the
+   catch-and-skip fix from the start (unlike `ppo`, which only gained them partway through).
+3. **Open question worth a real look, not assumed**: why is the baseline margin this tight
+   throughout (steps 30-91 consistently at 94-95% utilization), not just at outlier episodes? Now
+   that per-step `gpu_max_allocated_gb` is logged for every step (point 7), a future session can
+   plot this over the *entire* run (not just at crash time) and see whether it's flat, has a
+   pattern tied to specific turn counts/retrieval hits, or something else — this is a real
+   diagnostic opportunity the new instrumentation unlocks that wasn't possible with only
+   crash-time data.
+4. **Tasks 3-6 are unstarted**: held-out evaluation, `scripts/compare_ppo_runs.py`, the comparison
+   verdict, and the README/chart retrofit all still need real numbers from a completed `ppo` and
+   `mt_ppo` run before they can begin.
