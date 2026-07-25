@@ -28,8 +28,19 @@ Both conditions, launched with:
 
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m turn_level_rewards.train_ppo \
-    --condition {ppo,mt_ppo} --max-steps 500 --num-rollouts-per-step 2 --save-steps 15 --seed 42
+    --condition {ppo,mt_ppo} --train-size 90447 --max-steps 500 --num-rollouts-per-step 2 \
+    --save-steps 15 --seed 42
 ```
+
+**`--train-size 90447` is required and was initially omitted from this doc's first version** —
+`train_ppo.py`'s CLI defaults `--train-size` to `8` (a smoke-test default), and without an
+explicit override a "full run" would silently train on 8 repeated rows instead of the complete
+HotpotQA training set, matching the GRPO track's own real-full-run precedent (Phase 5 explicitly
+passed `--train-size 90447`). Caught only after a real launch actually ran 200+ steps against the
+default of 8 (confirmed via `sample_completions.log` showing the same 2 questions recurring
+across 20 logged samples, and via inspecting the live process's actual command line) — that run
+was killed and its output discarded; see `docs/phase-7b-full-ppo-runs.md`'s Handoff notes for the
+full account. This is now a required, explicit flag, not left to the CLI default.
 
 `--max-steps 500` and `--num-rollouts-per-step 2` are Task 1's probe results (paper-matched step
 count; hardware-driven batch size, the one deliberate deviation from the paper's 8×H100/batch=512

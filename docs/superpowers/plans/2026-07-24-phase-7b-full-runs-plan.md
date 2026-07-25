@@ -16,10 +16,15 @@ README pass using the `dataviz` skill (Task 6).
 
 ## Global Constraints
 
-- Both training runs use: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `--max-steps 500`,
-  `--num-rollouts-per-step 2`, `--save-steps 15`, `--seed 42` — see
+- Both training runs use: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `--train-size 90447`,
+  `--max-steps 500`, `--num-rollouts-per-step 2`, `--save-steps 15`, `--seed 42` — see
   `docs/superpowers/specs/2026-07-24-phase-7b-full-runs-design.md` for why `save_steps` is 15,
-  not the infra plan's default of 50.
+  not the infra plan's default of 50. **`--train-size 90447` is required** — `train_ppo.py`'s CLI
+  defaults `--train-size` to `8` (a smoke-test default); omitting this flag silently trains on 8
+  repeated rows instead of the full HotpotQA training set (this exact mistake happened once
+  during this phase's execution — a run got to step 219/500 before being caught and killed; see
+  the design doc's amendment and `docs/phase-7b-full-ppo-runs.md`'s Handoff notes for the full
+  account). Double-check every launch/resume command below actually includes it.
 - Runs are sequential, never parallel — this GPU cannot hold two training processes at once
   (each already uses ~92-94% of the RTX 4090's 24GB alone).
 - A crash during either run is expected, not exceptional (this session's live smoke test measured
@@ -60,7 +65,7 @@ Run: `curl -s -X POST http://localhost:8000/retrieve -H 'Content-Type: applicati
 
 - [ ] **Step 2: Launch the run**
 
-Run (in the background, since this takes ~1.4 hours): `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m turn_level_rewards.train_ppo --condition ppo --max-steps 500 --num-rollouts-per-step 2 --save-steps 15 --seed 42 2>&1 | tee /tmp/phase7b_ppo_full_run.log`
+Run (in the background, since this takes ~1.4 hours): `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m turn_level_rewards.train_ppo --condition ppo --train-size 90447 --max-steps 500 --num-rollouts-per-step 2 --save-steps 15 --seed 42 2>&1 | tee /tmp/phase7b_ppo_full_run.log`
 
 - [ ] **Step 3: Monitor to completion, resuming through any crashes**
 
@@ -68,7 +73,7 @@ Watch the log for progress (`step N/500`) and failure signatures (`OutOfMemoryEr
 `Traceback`, `Triton Error`). On a crash:
 1. Confirm it's a plain CUDA/Triton OOM (expected, per this phase's Global Constraints) — if it's
    something else, stop and report it as a real finding rather than retrying blind.
-2. Resume: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m turn_level_rewards.train_ppo --condition ppo --max-steps 500 --num-rollouts-per-step 2 --save-steps 15 --seed 42 --resume-from-checkpoint auto 2>&1 | tee -a /tmp/phase7b_ppo_full_run.log`
+2. Resume: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m turn_level_rewards.train_ppo --condition ppo --train-size 90447 --max-steps 500 --num-rollouts-per-step 2 --save-steps 15 --seed 42 --resume-from-checkpoint auto 2>&1 | tee -a /tmp/phase7b_ppo_full_run.log`
 3. Repeat until `step 500/500` is reached.
 
 Expected: eventually reaches `step 500/500`, `outputs/ppo/checkpoint-500` exists with `policy/`,
