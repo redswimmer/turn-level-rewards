@@ -1094,6 +1094,17 @@ class MTPPOTrainer(Trainer):
             ]
             episodes = self._collect_batch(batch_rows)
             update_metrics = self._ppo_update(episodes)
+            # Found live during Phase 7b's first full-scale run: a genuinely long episode (one
+            # observed at 2302 action tokens, ~2-20x this run's typical length) leaves the CUDA
+            # allocator fragmented enough after its own forward/backward passes that the very
+            # next step's ordinary-length episode then OOMs -- deterministically reproducible on
+            # every --resume-from-checkpoint replay of the same data order, since the same
+            # oversized episode recurs at the same step every time. Mirrors the same fix already
+            # applied before checkpoint saves (see _save_full_checkpoint): freeing cached-but-
+            # unused blocks after each step's own processing, not only at save boundaries, gives
+            # the next step's fresh allocations room regardless of how large the prior step's
+            # episodes were.
+            torch.cuda.empty_cache()
 
             mean_reward = sum(e["format_and_outcome_reward"] for e in episodes) / len(episodes)
             mean_retrieval_fraction = sum(e["retrieval_fraction"] for e in episodes) / len(episodes)
