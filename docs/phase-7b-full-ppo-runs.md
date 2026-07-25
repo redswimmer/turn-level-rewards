@@ -1,5 +1,88 @@
 # Phase 7b: Full PPO/MT-PPO training runs + evaluation + comparison
 
+## CURRENT HANDOFF (2026-07-24, read this first — everything below is historical detail)
+
+**Status**: Task 1 of `docs/superpowers/plans/2026-07-24-phase-7b-full-runs-plan.md` (the full
+`ppo` run) is in progress, not finished. As of this write-up: **step ~172/500, latest checkpoint
+`outputs/ppo/checkpoint-165`, process running unattended** (`ps aux | grep train_ppo` to check —
+it's a plain `nohup`'d background process, not managed by any agent session). Tasks 2-6 have not
+started. All work described below is committed; nothing is uncommitted or half-finished.
+
+### The problem, stated plainly
+
+This machine's single RTX 4090 runs this workload (Qwen3.5-0.8B policy + critic + both AdamW
+optimizers + rollout/generation activations) at a **persistently tight ~94-95% GPU memory
+utilization** — not an occasional spike, a stable operating point confirmed unchanged across
+steps 30-91 (22.83-23.23 GiB of 23.51 GiB, no growth trend, ruling out a memory leak). At this
+margin, a real fraction of individual training steps hit `torch.OutOfMemoryError` (or, in one
+observed case, a Triton-kernel OOM) — **currently 15.3% of all step-attempts so far (28 of 183)**.
+The root cause of individual failures varies (sometimes a single episode's generation rambles
+close to the per-turn `max_completion_length=2048` cap without producing a valid answer —
+confirmed directly against real episode data; sometimes just ordinary allocator variance at this
+tight a margin) — but the *why is the baseline this tight in the first place* question is still
+open, not answered (see "What we're considering" below).
+
+### What we've tried, in order, each with its real outcome
+
+1. **Task 1's wall-clock/OOM probe** (already-merged infra plan) — chose `num_rollouts_per_step=2`
+   + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` as the baseline config for this hardware.
+   Confirmed even this baseline OOMs ~1-in-3 short runs.
+2. **`torch.cuda.empty_cache()` before checkpoint saves** (infra plan, commit `65e082d`) — fixed a
+   real correlation between checkpoint-save timing and OOM.
+3. **`torch.cuda.empty_cache()` after every PPO update, not just saves** (commit `9c81021`) — fixed
+   a deterministic wall at step 19-20 (one 2302-token episode leaving the allocator fragmented for
+   the next step, replayed identically on every resume).
+4. **Caught a delegated agent in a runaway retry loop** (launching new attempts before the GPU
+   released from the last crash) — stopped it, took over running this directly rather than via a
+   sub-agent, going forward.
+5. **Catch CUDA OOM per-step and skip forward instead of crashing the process** (commit `118b690`,
+   researched against real practice — the PyTorch community catch/empty_cache/continue pattern and
+   veRL's own `filter_overlong_prompts` feature, not a seed-nudge guess). **This is the load-bearing
+   fix that got the run past 30 steps.** It does NOT reduce how often OOM happens — it changes what
+   happens when it does: the process survives and keeps going instead of needing a manual resume.
+6. **`scripts/analyze_train_log.py`** (commit `60eec1c`) — one-command outlier/skip-rate reporting
+   instead of manual grepping. Use this first when picking the run back up.
+7. **Per-step GPU memory instrumentation + failure-phase attribution** (commit `b8ce2a4`) —
+   `gpu_allocated_gb`/`gpu_max_allocated_gb`/`failed_at` now logged every step. **Does not apply to
+   the currently-running process** (no hot-reload) — only takes effect on the next launch/resume.
+8. **Quantified the skip mechanism's real cost, checked for selection bias** (commit `c0accf5`) —
+   15.1-15.3% of steps skipped means the "500-step" run is on track to deliver ~425 real gradient
+   updates, not 500 — a new, real, hardware-driven deviation from the paper's spec, on top of the
+   already-accepted batch-size deviation. Checked (not assumed) whether skipped rows are
+   systematically harder questions via character length as a difficulty proxy: no meaningful
+   difference (skipped mean=103 chars, normal mean=97) — suggestive, not conclusive, evidence
+   against a selection-bias distortion of what the policy learns.
+
+### What we're considering next (not yet decided — real options, not a recommendation to follow blindly)
+
+- **(a) Accept the current design and let both runs finish** — cheapest, already fully implemented.
+  Costs: ~15%+ of the intended 500 real steps lost to skips (quantified above), and an unresolved
+  question of whether `mt_ppo` will skip at a similar rate (if not, that's a real confound on the
+  comparison, not cosmetic).
+- **(b) Investigate why the baseline margin is this tight**, not just react to outlier episodes —
+  genuinely unexamined. Now that per-step `gpu_max_allocated_gb` is logged (item 7), a fresh look
+  could reveal a real, fixable inefficiency rather than an assumed hardware ceiling.
+- **(c) Redesign around a "target N successful steps" loop instead of "target N step-attempts"** —
+  a more rigorous fix for the cross-condition comparison-validity concern than "run both and hope
+  the skip rates happen to match": keep looping until 500 *real* updates occur, so `ppo` and
+  `mt_ppo` are compared on an equal real-training-step basis regardless of each one's own skip
+  rate. Not implemented — a real design change to `train()`'s loop structure, not a small patch.
+  Would need its own brainstorm before touching the trainer again.
+- **(d) More aggressive memory optimization** (8-bit optimizer states, CPU offload, reducing
+  `max_completion_length`) — not explored this session. Would directly attack the tight-margin
+  root cause rather than working around its symptoms, but each carries real implementation/
+  dependency/fidelity risk of its own, and would need its own research pass before committing to
+  one, the same standard applied to every other fix this session.
+- **`num_rollouts_per_step=1` is already ruled out** (Task 1's probe, infra plan): forward/backward
+  is per-episode, not batched, so a smaller group doesn't reduce per-episode memory pressure — it
+  only reduces gradient-signal quality for no OOM benefit.
+
+### Read next
+
+Everything below this section is the detailed, chronological record (Infrastructure verified,
+per-incident write-ups) that the summary above was distilled from — useful for verifying a
+specific claim above, not required reading to pick this back up.
+
 ## Goal
 
 Run both `ppo` and `mt_ppo` (deterministic rewards) to completion, evaluate both checkpoints on
