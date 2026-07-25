@@ -19,6 +19,7 @@ from turn_level_rewards.train_ppo import (
     compute_gae,
     compute_ppo_loss,
     place_turn_rewards,
+    resolve_auto_checkpoint,
     resolve_stop_token_ids,
     truncate_after_stop_token,
 )
@@ -590,3 +591,25 @@ def test_row_cycle_from_step_resumes_at_correct_position():
 
     assert next(cycle)["id"] == 1
     assert next(cycle)["id"] == 2
+
+
+def test_resolve_auto_checkpoint_returns_the_latest_checkpoint(tmp_path):
+    (tmp_path / "checkpoint-100").mkdir()
+    (tmp_path / "checkpoint-300").mkdir()
+    (tmp_path / "checkpoint-200").mkdir()
+
+    assert resolve_auto_checkpoint(str(tmp_path)).endswith("checkpoint-300")
+
+
+def test_resolve_auto_checkpoint_raises_a_clear_error_on_a_missing_output_dir(tmp_path):
+    """A first launch with `auto` used to die on a FileNotFoundError from inside transformers'
+    os.listdir, not on this module's own message -- the output dir does not exist yet, which is
+    the same "nothing to resume" case as an empty one.
+    """
+    with pytest.raises(ValueError, match="no checkpoint found"):
+        resolve_auto_checkpoint(str(tmp_path / "does-not-exist"))
+
+
+def test_resolve_auto_checkpoint_raises_on_an_existing_but_empty_output_dir(tmp_path):
+    with pytest.raises(ValueError, match="no checkpoint found"):
+        resolve_auto_checkpoint(str(tmp_path))

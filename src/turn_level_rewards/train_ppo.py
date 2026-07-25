@@ -12,6 +12,7 @@ import inspect
 import itertools
 import json
 import math
+import os
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -1409,6 +1410,30 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def resolve_auto_checkpoint(output_dir: str | None) -> str:
+    """Resolve `--resume-from-checkpoint auto` to the latest checkpoint under output_dir.
+
+    Raises rather than silently starting from scratch: `auto` means "continue the run I already
+    have", so a missing checkpoint is a mistake worth stopping on, not a reason to quietly begin
+    a fresh 500-step run under the same output_dir (which would interleave a new run's logs and
+    checkpoints with the old ones).
+
+    An output_dir that does not exist at all (or is None, which TrainingArguments permits) is the
+    same "nothing to resume" case, but transformers' get_last_checkpoint raises FileNotFoundError
+    from os.listdir before it can return None -- so a first launch with `auto` died on an opaque
+    traceback from library internals instead of this module's own message. Normalised here.
+    """
+    last_checkpoint = (
+        get_last_checkpoint(output_dir) if output_dir and os.path.isdir(output_dir) else None
+    )
+    if last_checkpoint is None:
+        raise ValueError(
+            f"--resume-from-checkpoint auto: no checkpoint found under {output_dir}. "
+            "Omit the flag entirely to start a fresh run."
+        )
+    return last_checkpoint
+
+
 def build_ppo_trainer(
     condition: Condition,
     train_size: int | None,
@@ -1448,11 +1473,7 @@ def main() -> None:
     )
     resume_from_checkpoint = args.resume_from_checkpoint
     if resume_from_checkpoint == "auto":
-        resume_from_checkpoint = get_last_checkpoint(config.output_dir)
-        if resume_from_checkpoint is None:
-            raise ValueError(
-                f"--resume-from-checkpoint auto: no checkpoint found under {config.output_dir}"
-            )
+        resume_from_checkpoint = resolve_auto_checkpoint(config.output_dir)
     config.resume_from_checkpoint = resume_from_checkpoint
     trainer = build_ppo_trainer(args.condition, args.train_size, config)
     trainer.train()
