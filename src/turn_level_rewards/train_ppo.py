@@ -1092,18 +1092,60 @@ class MTPPOTrainer(Trainer):
                 next(row_cycle)
                 for _ in range(self.args.num_rollouts_per_step)  # ty: ignore[unresolved-attribute]
             ]
-            episodes = self._collect_batch(batch_rows)
-            update_metrics = self._ppo_update(episodes)
             # Found live during Phase 7b's first full-scale run: a genuinely long episode (one
-            # observed at 2302 action tokens, ~2-20x this run's typical length) leaves the CUDA
-            # allocator fragmented enough after its own forward/backward passes that the very
-            # next step's ordinary-length episode then OOMs -- deterministically reproducible on
-            # every --resume-from-checkpoint replay of the same data order, since the same
-            # oversized episode recurs at the same step every time. Mirrors the same fix already
-            # applied before checkpoint saves (see _save_full_checkpoint): freeing cached-but-
-            # unused blocks after each step's own processing, not only at save boundaries, gives
-            # the next step's fresh allocations room regardless of how large the prior step's
-            # episodes were.
+            # observed at 2302 action tokens, ~2-20x this run's typical length) can leave the CUDA
+            # allocator fragmented enough after its own forward/backward passes that a later
+            # step's ordinary-length episode then OOMs -- deterministically reproducible on every
+            # --resume-from-checkpoint replay of the same data order, since the same oversized
+            # episode recurs at the same step every time (confirmed live: three consecutive
+            # resume attempts died at the identical point with byte-identical OOM diagnostics).
+            # Researched real-world practice before choosing a fix (not guessed): the standard
+            # PyTorch pattern for a per-batch OOM is catch, empty_cache, and move to the next
+            # batch rather than crash the whole process (e.g. PyTorch Forums/Databricks
+            # community threads on this exact error), and veRL (the framework Search-R1 -- the
+            # lineage this repo's own design already builds on -- is itself built on) ships a
+            # real `filter_overlong_prompts` feature with the same underlying philosophy: don't
+            # let one outlier-length example take down an entire training step. This step
+            # therefore catches a CUDA OOM at the per-step level, logs it as a real (not hidden)
+            # skipped step, and continues -- rather than crashing the whole process and forcing a
+            # resume (which pays a full model-reload cost and, per the finding above, can walk
+            # right back into the identical failure on a deterministic replay anyway).
+            #
+            # Known, accepted limitation: _ppo_update runs args.num_ppo_epochs inner epochs, each
+            # ending in a real optimizer.step() -- if the OOM happens partway through (e.g. epoch
+            # 3 of 4), the epochs that already completed have already applied real weight updates
+            # that are NOT rolled back just because this step is logged as "skipped". This is a
+            # deliberate simplicity tradeoff, not an oversight: a fully atomic per-step rollback
+            # would need to snapshot and restore optimizer/model state before every step, adding
+            # real overhead to every single step to guard against an occasional partial failure.
+            try:
+                episodes = self._collect_batch(batch_rows)
+                update_metrics = self._ppo_update(episodes)
+            except RuntimeError as exc:
+                # Catches both torch's own torch.OutOfMemoryError (a RuntimeError subclass) and
+                # Triton kernels' plain `RuntimeError: Triton Error [CUDA]: out of memory` (a
+                # real, separately-observed failure site in this repo's own live testing, not the
+                # same exception class as torch's) -- re-raise anything whose message doesn't
+                # actually say "out of memory", so a genuinely different bug still surfaces as a
+                # visible crash instead of being silently absorbed here.
+                if "out of memory" not in str(exc).lower():
+                    raise
+                torch.cuda.empty_cache()
+                skip_record = {
+                    "step": step,
+                    "skipped": True,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "questions_attempted": [row["question"] for row in batch_rows],
+                }
+                with log_path.open("a") as log_file:
+                    log_file.write(json.dumps(skip_record) + "\n")
+                print(
+                    f"step {step + 1}/{self.args.max_steps} | SKIPPED (CUDA OOM) -- "
+                    f"see train_log.jsonl for the questions attempted",
+                    flush=True,
+                )
+                self.state.global_step = step + 1
+                continue
             torch.cuda.empty_cache()
 
             mean_reward = sum(e["format_and_outcome_reward"] for e in episodes) / len(episodes)
