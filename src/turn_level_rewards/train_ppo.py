@@ -1083,6 +1083,13 @@ class MTPPOTrainer(Trainer):
         run_start = time.monotonic()
         for step in range(self.state.global_step, self.args.max_steps):
             step_start = time.monotonic()
+            # Reset here (not once at the top of train()) so max_memory_allocated below reflects
+            # THIS step's own peak, not a running max across the whole training run -- added
+            # after real live diagnosis needed exception-message archaeology (parsing "X GiB
+            # allocated" out of a caught OOM's str()) to answer "is memory actually growing over
+            # time, or just persistently tight?" Real per-step numbers make that a direct read
+            # instead of a reconstruction.
+            torch.cuda.reset_peak_memory_stats()
             # self.args.num_rollouts_per_step is a real field on this file's MTPPOConfig, but
             # Trainer's base type stub only knows self.args as the looser `TrainingArguments` --
             # same ty-can't-see-through-Trainer's-base-types root cause already noted throughout
@@ -1118,9 +1125,13 @@ class MTPPOTrainer(Trainer):
             # deliberate simplicity tradeoff, not an oversight: a fully atomic per-step rollback
             # would need to snapshot and restore optimizer/model state before every step, adding
             # real overhead to every single step to guard against an occasional partial failure.
+            failed_at = None
             try:
+                failed_at = "_collect_batch"
                 episodes = self._collect_batch(batch_rows)
+                failed_at = "_ppo_update"
                 update_metrics = self._ppo_update(episodes)
+                failed_at = None
             except RuntimeError as exc:
                 # Catches both torch's own torch.OutOfMemoryError (a RuntimeError subclass) and
                 # Triton kernels' plain `RuntimeError: Triton Error [CUDA]: out of memory` (a
@@ -1130,22 +1141,36 @@ class MTPPOTrainer(Trainer):
                 # visible crash instead of being silently absorbed here.
                 if "out of memory" not in str(exc).lower():
                     raise
+                gpu_stats = {
+                    "gpu_allocated_gb": torch.cuda.memory_allocated() / 1e9,
+                    "gpu_reserved_gb": torch.cuda.memory_reserved() / 1e9,
+                    "gpu_max_allocated_gb": torch.cuda.max_memory_allocated() / 1e9,
+                }
                 torch.cuda.empty_cache()
                 skip_record = {
                     "step": step,
                     "skipped": True,
+                    "failed_at": failed_at,
                     "reason": f"{type(exc).__name__}: {exc}",
                     "questions_attempted": [row["question"] for row in batch_rows],
+                    **gpu_stats,
                 }
                 with log_path.open("a") as log_file:
                     log_file.write(json.dumps(skip_record) + "\n")
                 print(
-                    f"step {step + 1}/{self.args.max_steps} | SKIPPED (CUDA OOM) -- "
-                    f"see train_log.jsonl for the questions attempted",
+                    f"step {step + 1}/{self.args.max_steps} | SKIPPED (CUDA OOM in {failed_at}) "
+                    f"-- allocated={gpu_stats['gpu_allocated_gb']:.2f}GB "
+                    f"peak={gpu_stats['gpu_max_allocated_gb']:.2f}GB -- see train_log.jsonl for "
+                    f"the questions attempted",
                     flush=True,
                 )
                 self.state.global_step = step + 1
                 continue
+            gpu_stats = {
+                "gpu_allocated_gb": torch.cuda.memory_allocated() / 1e9,
+                "gpu_reserved_gb": torch.cuda.memory_reserved() / 1e9,
+                "gpu_max_allocated_gb": torch.cuda.max_memory_allocated() / 1e9,
+            }
             torch.cuda.empty_cache()
 
             mean_reward = sum(e["format_and_outcome_reward"] for e in episodes) / len(episodes)
@@ -1165,6 +1190,7 @@ class MTPPOTrainer(Trainer):
                 "clip_fraction": update_metrics["clip_fraction"],
                 "reward": mean_reward,
                 "retrieval_fraction": mean_retrieval_fraction,
+                **gpu_stats,
             }
             trackio.log(metrics)
 
