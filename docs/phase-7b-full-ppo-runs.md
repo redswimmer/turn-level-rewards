@@ -359,3 +359,35 @@ happened this session that change how to interpret the run's current state and h
 4. **Tasks 3-6 are unstarted**: held-out evaluation, `scripts/compare_ppo_runs.py`, the comparison
    verdict, and the README/chart retrofit all still need real numbers from a completed `ppo` and
    `mt_ppo` run before they can begin.
+
+### A real, quantified new deviation from the paper's spec: the skip mechanism costs real training steps
+
+Pushed on directly (correctly) rather than left implicit: catch-and-skip (point 4 above) makes
+the run *complete*, but it does not make every one of the 500 step-indices a real gradient update.
+Measured directly from `outputs/ppo/train_log.jsonl` at step ~179: **15.1% of step-attempts so far
+were skipped (152 real steps out of 179 attempted).** If this rate holds for the rest of the run,
+`ppo`'s "500-step" run will deliver something closer to **~425 real PPO updates**, not 500 — a
+genuine, new, hardware-driven deviation from the paper's Appendix C.1.3 spec, on top of (not
+instead of) the already-documented `num_rollouts_per_step=2`-vs-512 batch-size deviation. This
+must be stated plainly in the eventual comparison write-up (Task 5), not silently absorbed into
+"ran the full 500 steps."
+
+**Checked, not assumed, whether this introduces a selection bias** (i.e. whether skipped rows are
+systematically the harder/longer-reasoning questions, which would be a real distortion of what the
+policy learns, not just a smaller sample): compared question character length (a crude but
+checkable proxy for difficulty) between skipped and normally-processed rows. Skipped: n=56,
+mean=103 chars, median=92. Normal: n=304, mean=97 chars, median=88. **No meaningful difference** —
+skipping looks closer to noise in the model's own generation behavior (whether a given rollout
+happens to ramble) than a systematic exclusion of harder questions, though question length is an
+imperfect difficulty proxy and this should be treated as suggestive, not conclusive.
+
+**What remains genuinely unresolved**: whether `mt_ppo` (not yet run) shows a similar skip rate
+and pattern. The actual scientific question Phase 7b tests is the *relative* `ppo` vs `mt_ppo`
+comparison (per CLAUDE.md's Goal section), which stays reasonably fair even at ~425 effective
+steps each *if both conditions lose a similar fraction similarly* — but if `mt_ppo`'s skip
+dynamics differ meaningfully from `ppo`'s (plausible, since `mt_ppo`'s turn-level reward could
+shape completion length differently), that would be a real confound on the comparison, not a
+cosmetic difference. **Task 5's comparison write-up must check this explicitly** (compare both
+conditions' actual skip rates and effective step counts, via `analyze_train_log.py` on each run's
+own `train_log.jsonl`) before treating any EM/F1 difference between conditions as attributable to
+the reward design alone.
