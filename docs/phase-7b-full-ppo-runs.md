@@ -80,6 +80,30 @@ convention). Leave this section for the next fresh agent to read first. -->
 still pending. See "Infrastructure verified" below for a real, completed live-smoke-test pass over
 the resume/diagnostics/eval machinery this phase's full runs will depend on.)
 
+### Real incident: first full-run launch was silently misconfigured (2026-07-24)
+
+The first attempt at Task 1 of the full-runs plan (`docs/superpowers/plans/2026-07-24-phase-7b-full-runs-plan.md`)
+launched `ppo`'s 500-step run without `--train-size`, which defaults to `8` in `train_ppo.py`'s
+CLI (a smoke-test default) rather than the full 90,447-row HotpotQA training set. The run reached
+step 219/500 with `reward` flat at exactly `-0.100` the entire time before this was caught —
+`sample_completions.log` showed the same 2 questions recurring across every logged sample, and
+the model's completions were a bare `<|endoftext|>` with no attempt at an answer or a search call
+at every single sample. Confirmed via the live process's own command line (no `--train-size`
+flag present). Killed immediately; the 219 steps of checkpoints/logs were discarded (not usable —
+wrong scale, not a resumable partial run). Both the design doc and the plan doc had this same
+omission (the GRPO track's own Phase 5 precedent explicitly passed `--train-size 90447`, but that
+override never made it into this phase's launch commands) — fixed in both, and in every
+launch/resume command in the plan, before relaunching. See the design doc's own amendment for the
+same account from that doc's side.
+
+**Lesson for whoever launches training in this repo going forward**: `train_ppo.py`'s CLI
+defaults (`--train-size 8`, `--max-steps 2`) are deliberately smoke-test-scale, per this repo's
+own established convention (`train.py`'s CLI works the same way) — a "full run" command must
+always be checked against every relevant flag's actual default, not just the ones that seem
+obviously important (`--max-steps` was remembered; `--train-size` wasn't). A flat/degenerate
+reward signal for more than a few dozen steps is worth checking the actual sampled completions
+for, not just the aggregate reward number, before assuming it's normal early-training behavior.
+
 ### Infrastructure verified (live smoke test, 2026-07-24, before any full run)
 
 Before committing to the full 500-step budget, Tasks 2-6's checkpoint-resume, diagnostics, and
