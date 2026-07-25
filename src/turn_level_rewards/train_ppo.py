@@ -960,16 +960,20 @@ class MTPPOTrainer(Trainer):
         """
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         self._save_policy_and_critic(output_dir)
-        # Real, research-confirmed fix, not precautionary: live smoke testing saw 6/7 CUDA OOMs
-        # land at or immediately after a checkpoint-save step boundary. Root cause (confirmed via
-        # direct transformers==5.13.0 source inspection): in this repo's single-GPU config,
-        # Trainer._save_optimizer_and_scheduler calls torch.save(self.optimizer.state_dict(), ...)
-        # directly on GPU-resident optimizer tensors (AdamW's exp_avg/exp_avg_sq) with no CPU
-        # transfer first. At this training process's real ~92-94% GPU utilization, torch.save's
-        # internal serialization needs a small amount of extra GPU-side working memory that the
-        # allocator doesn't have free, even though nothing is logically leaking. Freeing cached
-        # (allocated-but-unused) blocks here gives that save its room without touching any
-        # hyperparameter, gradient, or model output.
+        # Live smoke testing saw a 6/7 CUDA OOM rate this session, with most failures landing at
+        # or near a checkpoint-save step boundary -- but the raw tracebacks never actually showed
+        # the save call itself in the stack (see docs/phase-7b-full-ppo-runs.md's "honest caveat"
+        # for the specific step-offset counterexamples), so treat the boundary correlation as a
+        # plausible, re-test-confirmed contributing factor, not a fully nailed-down root cause.
+        # What IS confirmed via direct transformers==5.13.0 source inspection: in this repo's
+        # single-GPU config, Trainer._save_optimizer_and_scheduler calls
+        # torch.save(self.optimizer.state_dict(), ...) directly on GPU-resident optimizer tensors
+        # (AdamW's exp_avg/exp_avg_sq) with no CPU transfer first -- a documented PyTorch/HF
+        # community OOM trigger when GPU memory is already this tight (~92-94% utilized here).
+        # Freeing cached (allocated-but-unused) blocks before that save gives it room without
+        # touching any hyperparameter, gradient, or model output; re-tested once, it took mt_ppo's
+        # regression check from 4/4 failures to 1/1 success -- real signal, but only one data
+        # point so far.
         torch.cuda.empty_cache()
         self._save_optimizer_and_scheduler(output_dir)
         self._save_rng_state(output_dir)
