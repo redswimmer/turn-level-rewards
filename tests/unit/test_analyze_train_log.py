@@ -5,6 +5,7 @@ from scripts.analyze_train_log import (
     find_outlier_episodes,
     find_skips,
     load_records,
+    reward_variance_report,
     skip_rate_by_window,
 )
 
@@ -78,3 +79,42 @@ def test_load_records_skips_unparseable_lines(tmp_path):
     records = load_records(str(log_path))
 
     assert records == [{"step": 0}]
+
+
+def test_reward_variance_report_flags_a_constant_reward_as_a_dead_run():
+    """The exact 2026-07-24 signature: every step scoring the identical format-penalty floor.
+
+    Nothing else in this script could see it -- token stats and skip rates both looked normal
+    while 177 steps learned nothing.
+    """
+    records = [{"step": i, "reward": -0.1} for i in range(30)]
+
+    report = reward_variance_report(records)
+
+    assert report["is_constant"] is True
+    assert report["distinct_values"] == 1
+    assert report["min"] == report["max"] == -0.1
+
+
+def test_reward_variance_report_does_not_flag_a_moving_reward():
+    records = [{"step": i, "reward": -0.1 + 0.01 * i} for i in range(30)]
+
+    report = reward_variance_report(records)
+
+    assert report["is_constant"] is False
+    assert report["distinct_values"] == 30
+
+
+def test_reward_variance_report_ignores_skipped_steps():
+    """A skipped step has no reward to speak of; counting it would fake variance into a dead run."""
+    records: list[dict] = [{"step": i, "reward": -0.1} for i in range(10)]
+    records.append({"step": 10, "skipped": True, "reward": 0.0, "reason": "CUDA OOM"})
+
+    report = reward_variance_report(records)
+
+    assert report["steps"] == 10
+    assert report["is_constant"] is True
+
+
+def test_reward_variance_report_handles_a_log_with_no_real_steps():
+    assert reward_variance_report([{"step": 0, "skipped": True}])["steps"] == 0

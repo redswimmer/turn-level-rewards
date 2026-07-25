@@ -47,6 +47,68 @@ _DEAD_REWARD_STEP_THRESHOLD = 20
 _FORMAT_COLLAPSE_STREAK_THRESHOLD = 20
 
 
+def resolve_stop_token_ids(
+    tokenizer_eos_token_id: int, model_eos_token_id: int | list[int] | None
+) -> list[int]:
+    """Token ids that end a single assistant turn, tokenizer's own eos first.
+
+    Load-bearing, and the root cause of the 2026-07-24 flat-reward incident when it was missing.
+    A chat model has two different "end" tokens and they are not interchangeable: for
+    Qwen/Qwen3.5-0.8B, `tokenizer.eos_token_id` is `<|im_end|>` (248046, ends an assistant TURN)
+    while `model.generation_config.eos_token_id` is `<|endoftext|>` (248044, ends a DOCUMENT).
+    `generate()` defaults to the model's, so without this a turn never stops at its own
+    terminator: the policy sails past `<|im_end|>` and keeps decoding until it happens to emit
+    `<|endoftext|>` or hits max_new_tokens.
+
+    Two separate harms followed, both confirmed against real run data, not theorised:
+      1. TRL's response template closes the `content` field at `<|im_end|>`, so trailing text
+         opened a SECOND content region that overwrote the first -- the model's real
+         `<answer>...</answer>` was discarded before format_reward/outcome_reward ever saw it, and
+         reward was a constant -0.1 for 100% of 332 episodes (zero variance, so PPO advantages
+         collapsed to ~0 and the policy stopped moving by ~step 20).
+      2. The overrun decoded into hallucinated `<|im_start|>user`/`<tool_response>` turns -- the
+         policy role-playing the environment -- inflating per-turn token counts (p95 1928, max
+         3289 action tokens for a task whose correct answer is ~16) and driving the run's ~15%
+         per-step CUDA OOM rate.
+
+    TRL's own GRPOTrainer does exactly this override (`grpo_trainer.py`, `"eos_token_id":
+    self._tokenizer.eos_token_id`, with a comment citing transformers#42762), which is why the
+    Phase 5/6 GRPO runs were unaffected -- this hand-built rollout loop simply did not inherit it.
+    Both ids are kept, not just the tokenizer's: a genuine `<|endoftext|>` should still stop
+    generation rather than decode into whatever follows it.
+    """
+    model_ids = (
+        []
+        if model_eos_token_id is None
+        else [model_eos_token_id]
+        if isinstance(model_eos_token_id, int)
+        else list(model_eos_token_id)
+    )
+    stop_ids = [tokenizer_eos_token_id]
+    stop_ids.extend(token_id for token_id in model_ids if token_id not in stop_ids)
+    return stop_ids
+
+
+def truncate_after_stop_token(token_ids: list[int], stop_token_ids: list[int]) -> list[int]:
+    """Cut a generated turn at its first stop token (kept), dropping anything after it.
+
+    Defense in depth behind resolve_stop_token_ids, not a redundant second copy of it: passing
+    the right `eos_token_id` to `generate()` is what SHOULD make this a no-op, but this is the
+    guarantee that the action mask can never extend past a turn boundary even if that ever
+    regresses again. _rollout_episode marks every returned token `action_mask=1`, so an overrun
+    does not merely waste tokens -- PPO would compute ratios and GAE over tokens where the policy
+    is impersonating the retrieval server, training it to fabricate tool output.
+
+    A turn with no stop token (hit max_new_tokens mid-sentence) is returned whole: that is a real
+    truncated turn, and silently emptying it would destroy the episode rather than record it.
+    """
+    stops = set(stop_token_ids)
+    for index, token_id in enumerate(token_ids):
+        if token_id in stops:
+            return token_ids[: index + 1]
+    return token_ids
+
+
 @dataclass
 class _CollapseAlert:
     title: str
@@ -78,9 +140,12 @@ class CollapseMonitor:
     def __init__(self) -> None:
         self._reward_ever_nonzero = False
         self._dead_reward_alerted = False
+        self._distinct_rewards: set[float] = set()
+        self._constant_reward_alerted = False
         self._format_ever_compliant = False
         self._format_collapse_streak = 0
         self._format_collapse_alerted = False
+        self._format_never_compliant_alerted = False
 
     def check(
         self, step: int, loss: float, mean_reward: float, mean_format_reward: float
@@ -117,6 +182,34 @@ class CollapseMonitor:
             )
             self._dead_reward_alerted = True
 
+        # A reward pinned at ONE value carries no more learning signal than a reward pinned at
+        # zero -- PPO's advantage is (return - baseline), and a critic converges onto a constant
+        # almost immediately, driving advantages to ~0. The pre-existing dead-reward check above
+        # could not see this: it tests `mean_reward != 0.0`, so the 2026-07-24 incident's constant
+        # -0.1 marked the reward "alive" on step 0 and suppressed the alert for all 177 steps
+        # while nothing was being learned. Distinct-value counting catches the general case.
+        self._distinct_rewards.add(mean_reward)
+        if (
+            self._reward_ever_nonzero
+            and len(self._distinct_rewards) == 1
+            and not self._constant_reward_alerted
+            and step >= _DEAD_REWARD_STEP_THRESHOLD
+        ):
+            alerts.append(
+                _CollapseAlert(
+                    title="Constant reward",
+                    text=(
+                        f"Mean reward has been exactly {mean_reward} on all {step + 1} steps so "
+                        "far -- zero variance means near-zero PPO advantage regardless of the "
+                        "reward's magnitude. Check that completions are being parsed as the "
+                        "reward functions expect (a rollout-loop bug can score every episode "
+                        "identically without ever erroring)."
+                    ),
+                    level="ERROR",
+                )
+            )
+            self._constant_reward_alerted = True
+
         if mean_format_reward > 0.0:
             self._format_ever_compliant = True
             self._format_collapse_streak = 0
@@ -141,6 +234,24 @@ class CollapseMonitor:
                     )
                 )
                 self._format_collapse_alerted = True
+        elif not self._format_never_compliant_alerted and step >= _FORMAT_COLLAPSE_STREAK_THRESHOLD:
+            # The branch above only fires on a REGRESSION from a compliant state, so a run that
+            # was never once compliant -- the actual 2026-07-24 signature -- fell through both
+            # branches silently. Never-compliant is the more urgent diagnosis of the two: a
+            # collapse means the policy lost something it had, this means the plumbing between
+            # generation and the reward functions may never have worked at all.
+            alerts.append(
+                _CollapseAlert(
+                    title="Format never compliant",
+                    text=(
+                        f"format_reward has been non-positive on every one of the first "
+                        f"{step + 1} steps -- no completion has ever parsed as a well-formed "
+                        "<answer>. Suspect the rollout/parsing path before suspecting the policy."
+                    ),
+                    level="ERROR",
+                )
+            )
+            self._format_never_compliant_alerted = True
 
         return alerts
 
@@ -431,6 +542,12 @@ class MTPPOTrainer(Trainer):
         super().__init__(model=model, args=args, train_dataset=train_dataset, callbacks=callbacks)
         self.tokenizer = add_response_schema(tokenizer)
         self.training_chat_template = get_training_chat_template(self.tokenizer)
+        # Resolved once here rather than per-generate call so the policy's own generation_config
+        # is read before any of it is mutated, and so a mismatch is visible in one place. See
+        # resolve_stop_token_ids' docstring for why this is not optional.
+        self.stop_token_ids = resolve_stop_token_ids(
+            self.tokenizer.eos_token_id, model.policy.generation_config.eos_token_id
+        )
 
     # create_optimizer(self) intentionally omits the base transformers.Trainer.create_optimizer's
     # optional `model` parameter. The internal Trainer code path that passes it positionally
@@ -542,9 +659,15 @@ class MTPPOTrainer(Trainer):
                     max_new_tokens=self.args.max_completion_length,  # ty: ignore[unresolved-attribute]
                     do_sample=True,
                     temperature=1.0,
+                    # Without this, generate() falls back to the policy's own
+                    # generation_config.eos_token_id (<|endoftext|>, a DOCUMENT terminator) and
+                    # sails straight past each turn's <|im_end|>. See resolve_stop_token_ids.
+                    eos_token_id=self.stop_token_ids,
                 )
             policy.train()  # ty: ignore[unresolved-attribute]
-            new_token_ids = generation[0, len(prompt_token_ids) :].tolist()
+            new_token_ids = truncate_after_stop_token(
+                generation[0, len(prompt_token_ids) :].tolist(), self.stop_token_ids
+            )
             parsed = parse_response(self.tokenizer, new_token_ids, prefix=prompt_token_ids)
             messages.append(parsed)
 

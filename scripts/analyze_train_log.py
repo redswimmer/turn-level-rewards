@@ -103,6 +103,34 @@ def skip_rate_by_window(records: list[dict[str, Any]], window: int = 20) -> list
     return windows
 
 
+def reward_variance_report(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """How much the per-step mean reward actually MOVES -- the check this script was missing.
+
+    Added after the 2026-07-24 incident, in which a broken rollout loop scored every one of 332
+    episodes at exactly -0.1. Nothing crashed, no alert fired, and the loss curve looked textbook
+    (value_loss 20.5 -> 0.046, which reads as excellent critic convergence and was really the
+    critic learning a constant). The run burned 177 steps learning nothing.
+
+    A constant reward is a dead run regardless of its magnitude: PPO's advantage is
+    (return - baseline), and a critic fits a constant almost immediately, so advantages decay to
+    ~0. Reporting distinct-value count alongside the min/max makes that visible in one line --
+    every other statistic in this script would look perfectly healthy while it was happening.
+    """
+    rewards = [r["reward"] for r in records if not r.get("skipped") and "reward" in r]
+    if not rewards:
+        return {"steps": 0}
+    distinct = sorted(set(rewards))
+    return {
+        "steps": len(rewards),
+        "distinct_values": len(distinct),
+        "min": min(rewards),
+        "max": max(rewards),
+        "mean": sum(rewards) / len(rewards),
+        # The headline: one distinct value across many steps is the failure signature itself.
+        "is_constant": len(distinct) == 1,
+    }
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Flag anomalies (outlier-length episodes, OOM skips) in a train_log.jsonl."
@@ -133,6 +161,22 @@ def main() -> None:
         return
 
     print(f"{len(records)} total records ({args.log_path})")
+
+    # Printed first, and loudly: a constant reward invalidates every other number below it, so a
+    # reader must not have to scroll past healthy-looking token and skip statistics to find it.
+    reward = reward_variance_report(records)
+    if reward["steps"]:
+        print(
+            f"\nreward across {reward['steps']} real steps: "
+            f"{reward['distinct_values']} distinct value(s), "
+            f"min={reward['min']:.3f} mean={reward['mean']:.3f} max={reward['max']:.3f}"
+        )
+        if reward["is_constant"]:
+            print(
+                f"  *** DEAD RUN: reward is exactly {reward['min']:.3f} on every step. Zero "
+                "variance means near-zero PPO advantage -- nothing is being learned, whatever "
+                "the loss curve looks like. Suspect the rollout/parsing path first."
+            )
 
     stats = episode_token_stats(records)
     if stats:

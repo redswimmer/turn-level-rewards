@@ -19,6 +19,8 @@ from turn_level_rewards.train_ppo import (
     compute_gae,
     compute_ppo_loss,
     place_turn_rewards,
+    resolve_stop_token_ids,
+    truncate_after_stop_token,
 )
 
 
@@ -395,10 +397,19 @@ def test_collapse_monitor_stops_on_non_finite_loss():
 
 
 def test_collapse_monitor_no_alerts_for_healthy_run():
+    """A healthy run's mean reward MOVES between steps.
+
+    This originally passed a fixed mean_reward=1.0 for all 30 steps. That encoded an assumption
+    the 2026-07-24 flat-reward incident disproved: a bit-identical mean reward step after step is
+    itself the failure signature (see test_collapse_monitor_fires_constant_reward_alert), not a
+    picture of health, so the healthy case has to vary to still mean anything.
+    """
     monitor = CollapseMonitor()
 
     for step in range(30):
-        alerts = monitor.check(step=step, loss=0.5, mean_reward=1.0, mean_format_reward=0.1)
+        alerts = monitor.check(
+            step=step, loss=0.5, mean_reward=1.0 + 0.01 * step, mean_format_reward=0.1
+        )
         assert alerts == []
 
 
@@ -452,6 +463,93 @@ def test_collapse_monitor_each_alert_fires_only_once():
 
     more_alerts = monitor.check(step=25, loss=0.5, mean_reward=0.0, mean_format_reward=0.1)
     assert more_alerts == []
+
+
+def test_collapse_monitor_fires_constant_reward_alert():
+    """Reward pinned at one nonzero value for many steps is a dead signal, not a healthy one.
+
+    This is the exact 2026-07-24 failure the old monitor could not see: mean_reward was -0.1 on
+    every one of 158 steps. The pre-existing "Dead reward" check only tested `mean_reward != 0.0`,
+    so a constant -0.1 marked the reward "alive" at step 0 and permanently suppressed the alert.
+    """
+    monitor = CollapseMonitor()
+
+    fired: list = []
+    for step in range(25):
+        fired.extend(monitor.check(step=step, loss=0.5, mean_reward=-0.1, mean_format_reward=0.1))
+
+    assert len(fired) == 1
+    assert "Constant reward" in fired[0].title
+    assert fired[0].should_stop is False
+
+
+def test_collapse_monitor_fires_format_never_compliant_alert():
+    """format_reward non-positive from the very first step must alert too.
+
+    The pre-existing collapse check was gated on `elif self._format_ever_compliant`, so a run that
+    was NEVER compliant -- which is what a broken rollout loop produces -- could never trip it.
+    A never-compliant run is a more urgent signal than a regression, not a lesser one.
+    """
+    monitor = CollapseMonitor()
+
+    fired: list = []
+    for step in range(25):
+        fired.extend(monitor.check(step=step, loss=0.5, mean_reward=-0.1, mean_format_reward=-0.1))
+
+    titles = [alert.title for alert in fired]
+    assert "Format never compliant" in titles
+    assert all(alert.should_stop is False for alert in fired)
+
+
+def test_collapse_monitor_no_format_alert_once_compliance_is_seen():
+    monitor = CollapseMonitor()
+
+    fired: list = []
+    for step in range(25):
+        fired.extend(
+            monitor.check(
+                step=step, loss=0.5, mean_reward=0.5 + 0.01 * step, mean_format_reward=0.1
+            )
+        )
+
+    assert fired == []
+
+
+def test_resolve_stop_token_ids_puts_the_chat_turn_terminator_first():
+    """The tokenizer's eos (the chat turn terminator) must be a stop id, even when the model's own
+    generation_config names a different one.
+
+    This is the root cause of the 2026-07-24 flat-reward incident, pinned as a test: for
+    Qwen/Qwen3.5-0.8B, tokenizer.eos_token_id is <|im_end|> (248046) but
+    model.generation_config.eos_token_id is <|endoftext|> (248044). Generating with only the
+    latter runs every turn past its own terminator.
+    """
+    assert resolve_stop_token_ids(248046, 248044) == [248046, 248044]
+
+
+def test_resolve_stop_token_ids_deduplicates_and_accepts_a_list_or_none():
+    assert resolve_stop_token_ids(248046, 248046) == [248046]
+    assert resolve_stop_token_ids(248046, [248044, 248046]) == [248046, 248044]
+    assert resolve_stop_token_ids(248046, None) == [248046]
+
+
+def test_truncate_after_stop_token_keeps_the_terminator_and_drops_everything_after():
+    """A turn ends at its terminator; anything decoded past it is not part of this turn.
+
+    Real observed tail from the incident: after emitting <|im_end|>, the policy kept decoding
+    `\\n<|im_start|>user\\n<tool_response>{"results": ...}` -- hallucinating the environment's next
+    turn. Those tokens were being marked action_mask=1 and trained on.
+    """
+    assert truncate_after_stop_token([1, 2, 99, 3, 4], stop_token_ids=[99]) == [1, 2, 99]
+
+
+def test_truncate_after_stop_token_is_a_noop_when_no_stop_token_is_present():
+    """A turn that hit max_new_tokens without terminating is returned whole, not silently emptied."""
+    assert truncate_after_stop_token([1, 2, 3], stop_token_ids=[99]) == [1, 2, 3]
+
+
+def test_truncate_after_stop_token_cuts_at_the_first_of_several_stop_ids():
+    assert truncate_after_stop_token([1, 88, 2, 99], stop_token_ids=[99, 88]) == [1, 88]
 
 
 def test_parse_args_resume_and_save_steps_defaults():
