@@ -16,6 +16,8 @@ docs/superpowers/specs/2026-07-23-phase-7b-full-ppo-runs-design.md.
 import argparse
 import json
 import time
+import traceback
+from datetime import datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -76,6 +78,58 @@ def aggregate_eval_metrics(
         "retrieval_fraction": sum(retrieval_fractions) / num_examples,
         "num_examples": num_examples,
     }
+
+
+def shard_rows(rows: list[dict], shard: int, num_shards: int) -> list[dict]:
+    """Take shard `shard` of `num_shards` from rows, strided so shards are length-balanced.
+
+    Exists because a single-process eval leaves this machine almost entirely idle. Measured
+    mid-run on the full 7,405-row mt_ppo eval: 1 of 32 CPU cores busy (load average 1.20), GPU
+    at 39-41% utilization and 17-18% memory bandwidth, 5.1 of 24 GB used. Nothing was saturated
+    -- a single Python thread was serially issuing one tiny decode kernel per generated token,
+    so the limit was one thread's ability to issue work, not any resource running out. Running
+    several shards as independent processes fills that idle capacity.
+
+    Strided (rows[shard::num_shards]) rather than contiguous blocks: episode wall-clock varies
+    by an order of magnitude with episode length, so a contiguous split can hand one shard a run
+    of long episodes and leave every other process waiting on that straggler. Striding
+    interleaves them, and also guarantees shard sizes differ by at most one.
+    """
+    if num_shards < 1:
+        raise ValueError(f"num_shards must be >= 1, got {num_shards}")
+    if not 0 <= shard < num_shards:
+        raise ValueError(f"shard must be in [0, {num_shards}), got {shard}")
+    return rows[shard::num_shards]
+
+
+def merge_shard_metrics(shard_metrics: list[dict]) -> dict:
+    """Combine per-shard metrics into one full-set result, weighted by example count.
+
+    Weighted, not a plain mean of shard means: strided shards differ in size by up to one row,
+    so an unweighted average would misreport the full-set number by a small but entirely
+    avoidable amount.
+
+    Refuses any shard still marked {"complete": false}. Those files exist by design (run_eval
+    writes running metrics so a long job is inspectable and a crash costs only the remaining
+    rows), which is exactly why merging must reject them -- silently averaging a partial shard
+    would report a full-set number computed from a fraction of the set, with nothing in the
+    output to reveal it.
+    """
+    if not shard_metrics:
+        raise ValueError("no shard metrics to merge")
+    incomplete = [m for m in shard_metrics if m.get("complete") is False]
+    if incomplete:
+        raise ValueError(
+            f"refusing to merge {len(incomplete)} incomplete shard(s) -- "
+            "rerun them before merging, or the merged metrics describe a partial eval"
+        )
+
+    total = sum(m["num_examples"] for m in shard_metrics)
+    weighted = {
+        key: sum(m[key] * m["num_examples"] for m in shard_metrics) / total
+        for key in ("exact_match", "f1", "retrieval_fraction")
+    }
+    return {**weighted, "num_examples": total, "num_shards": len(shard_metrics)}
 
 
 def build_eval_trainer(condition: Condition, checkpoint_dir: str, seed: int) -> MTPPOTrainer:
@@ -172,19 +226,67 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval-size", type=int, default=4)
     parser.add_argument("--output", default=None)
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Split the eval set across this many independent processes (see shard_rows).",
+    )
+    parser.add_argument(
+        "--shard", type=int, default=0, help="Which shard this process evaluates, 0-indexed."
+    )
     return parser.parse_args(argv)
 
 
 def main() -> None:
     args = _parse_args()
-    trainer = build_eval_trainer(args.condition, args.checkpoint_dir, args.seed)
-    rows = list(data.load_eval_dataset(n=args.eval_size, seed=args.seed))
     output_path = Path(args.output or f"results/{args.condition}_ppo_eval_metrics.json")
-    # Partial metrics land at the real output path as the run proceeds, marked
-    # {"complete": false} until the final row, so a long eval is inspectable mid-flight.
-    metrics = run_eval(trainer, rows, partial_path=output_path)
+    label = f"{args.condition} shard {args.shard}/{args.num_shards}"
 
-    _write_metrics(output_path, {**metrics, "complete": True})
+    # Everything a post-mortem needs, printed before any slow work starts, so a log tail alone
+    # identifies which shard/checkpoint/output a crashed process was working on. Reconstructing
+    # that from a bare traceback across several concurrent shards is exactly the guesswork this
+    # avoids.
+    print(
+        f"[{label}] checkpoint={args.checkpoint_dir} eval_size={args.eval_size} "
+        f"seed={args.seed} output={output_path} started={datetime.now().isoformat(timespec='seconds')}",
+        flush=True,
+    )
+
+    try:
+        trainer = build_eval_trainer(args.condition, args.checkpoint_dir, args.seed)
+        rows = shard_rows(
+            list(data.load_eval_dataset(n=args.eval_size, seed=args.seed)),
+            shard=args.shard,
+            num_shards=args.num_shards,
+        )
+        print(f"[{label}] evaluating {len(rows)} rows", flush=True)
+        # Partial metrics land at the real output path as the run proceeds, marked
+        # {"complete": false} until the final row, so a long eval is inspectable mid-flight.
+        metrics = run_eval(trainer, rows, partial_path=output_path)
+    except BaseException as exc:
+        # The failure is recorded in the OUTPUT ARTIFACT, not only on stdout: a shard that dies
+        # leaves a file saying so, so the merge step refuses it (complete=false) and a reader
+        # inspecting results sees the error without having to find and read the right log.
+        # BaseException, not Exception, so a KeyboardInterrupt/SystemExit kill is recorded too --
+        # those are the likeliest ways a multi-hour job ends.
+        _write_metrics(
+            output_path,
+            {
+                "complete": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "shard": args.shard,
+                "num_shards": args.num_shards,
+                "checkpoint_dir": args.checkpoint_dir,
+                "failed_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+        print(f"[{label}] FAILED: {type(exc).__name__}: {exc}", flush=True)
+        traceback.print_exc()
+        raise
+
+    _write_metrics(output_path, {**metrics, "complete": True, "shard": args.shard})
+    print(f"[{label}] done: {metrics}", flush=True)
     print(f"Wrote eval metrics to {output_path}")
 
 

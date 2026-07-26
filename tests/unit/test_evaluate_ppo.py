@@ -7,7 +7,12 @@ convention as train_ppo.py's own untested methods.
 
 import json
 
-from turn_level_rewards.evaluate_ppo import aggregate_eval_metrics
+import pytest
+from turn_level_rewards.evaluate_ppo import (
+    aggregate_eval_metrics,
+    merge_shard_metrics,
+    shard_rows,
+)
 
 
 def test_aggregate_eval_metrics_computes_means():
@@ -112,3 +117,84 @@ def test_run_eval_rolls_out_every_row_exactly_once():
     run_eval(trainer, _rows(7), report_every=3)
 
     assert trainer.calls == 7
+
+
+def test_shard_rows_partitions_every_row_exactly_once():
+    """Sharding must be a partition: no row evaluated twice (which would double-weight it in the
+    merged metric) and none dropped (which would silently shrink the held-out set).
+    """
+    rows = [{"i": i} for i in range(103)]  # deliberately not divisible by num_shards
+
+    shards = [shard_rows(rows, shard=s, num_shards=4) for s in range(4)]
+
+    recovered = sorted(r["i"] for shard in shards for r in shard)
+    assert recovered == list(range(103))
+
+
+def test_shard_rows_balances_length_within_one_row():
+    """Strided (not contiguous) so shards get an even mix of short and long episodes -- a
+    contiguous split would let one shard draw a run of long ones and straggle.
+    """
+    rows = [{"i": i} for i in range(103)]
+
+    sizes = [len(shard_rows(rows, shard=s, num_shards=4)) for s in range(4)]
+
+    assert max(sizes) - min(sizes) <= 1
+
+
+def test_shard_rows_single_shard_is_the_whole_set():
+    rows = [{"i": i} for i in range(10)]
+
+    assert shard_rows(rows, shard=0, num_shards=1) == rows
+
+
+def test_shard_rows_rejects_an_out_of_range_shard_index():
+    """Off-by-one here would silently evaluate an empty set and report metrics of 0.0."""
+    rows = [{"i": i} for i in range(10)]
+
+    with pytest.raises(ValueError, match="shard"):
+        shard_rows(rows, shard=4, num_shards=4)
+
+
+def test_merge_shard_metrics_weights_by_example_count():
+    """Shards can differ in size by one row, so a plain mean of shard means is wrong."""
+    merged = merge_shard_metrics(
+        [
+            {"exact_match": 1.0, "f1": 1.0, "retrieval_fraction": 0.5, "num_examples": 90},
+            {"exact_match": 0.0, "f1": 0.0, "retrieval_fraction": 1.0, "num_examples": 10},
+        ]
+    )
+
+    assert merged["num_examples"] == 100
+    assert merged["exact_match"] == pytest.approx(0.9)
+    assert merged["retrieval_fraction"] == pytest.approx(0.55)
+
+
+def test_merge_shard_metrics_refuses_incomplete_shards():
+    """A partial shard file must never be silently merged as if it were a finished result --
+    that would report a full-set number computed from a fraction of the set.
+    """
+    with pytest.raises(ValueError, match="incomplete"):
+        merge_shard_metrics(
+            [
+                {
+                    "exact_match": 1.0,
+                    "f1": 1.0,
+                    "retrieval_fraction": 0.5,
+                    "num_examples": 50,
+                    "complete": True,
+                },
+                {
+                    "exact_match": 0.0,
+                    "f1": 0.0,
+                    "retrieval_fraction": 0.5,
+                    "num_examples": 10,
+                    "complete": False,
+                },
+            ]
+        )
+
+
+def test_merge_shard_metrics_refuses_an_empty_list():
+    with pytest.raises(ValueError, match="no shard"):
+        merge_shard_metrics([])
