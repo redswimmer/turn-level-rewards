@@ -161,9 +161,28 @@ All on the real model, real retrieval server, RTX 4090:
 | Eval path, all three arms | train → checkpoint → sharded eval → metrics, exit 0 |
 | Hyperparameters identical across arms | verified programmatically, including 8-bit |
 
-**100-step verification of all three arms was in progress at handoff time.** Check
-`outputs/{ppo,ppo_mr,mt_ppo}/train_log.jsonl` — if those directories contain 100-step logs, read
-the skip counts before launching. See §6.
+### 100-step verification, all three arms (completed before handoff)
+
+```
+arm      steps  skip  peakGPU  endedOnTool   format compliance    tools/ep  rewardVals
+                                              (steps 0-49 → 50-99)
+ppo        100    0    18.2GB     0/400      not measurable*        2.11        3
+ppo_mr      99    1    23.5GB     0/396      0.61 → 0.83            1.61       14
+mt_ppo     100    0    23.0GB     0/400      0.78 → 0.80            1.69       12
+```
+
+Wall-clock: `ppo` 20 min, `ppo_mr` 42 min, `mt_ppo` 36 min per 100 steps — so budget roughly
+**1.7 / 3.5 / 3.0 hours** for the 500-step runs.
+
+`*` PPO-OR's reward is binary correctness with no format term, so `format_and_outcome_reward`
+cannot distinguish "wrong answer" from "no answer". `format_ok` is now logged per episode
+(commit `b94b9c5`) and will be measurable for all three arms in the real runs.
+
+**Read this honestly**: `ended_on_tool` held at 0 across all 1,196 episodes, format compliance is
+far above the pre-fix ~0.48 and rising for `ppo_mr`, and reward has genuine variance. But peak
+memory climbed back toward the ceiling as episodes grew (23.5 GB on `ppo_mr`, one skip). That is
+~1%, and it landed on `ppo_mr` rather than `mt_ppo`, so it is not the asymmetry that invalidated
+Phase 7b — but it is not zero. Treat §6's skip gate as a real check, not a formality.
 
 ---
 
@@ -185,12 +204,17 @@ but they must be stated in any write-up, alongside the pre-existing ones in `CLA
 
 ## 6. Gates — stop and investigate rather than burning 15 hours
 
-1. **Skip rate must stay ~0.** Check at step ~100 and again at ~300:
+1. **Skip rate must stay low and SYMMETRIC.** Check at step ~100 and again at ~300:
    `.venv/bin/python scripts/analyze_train_log.py outputs/<arm>/train_log.jsonl`
-   Any nonzero rate that differs between arms reintroduces the confound that invalidated Phase
-   7b. Peak GPU is ~19.75 GB against a ~23.5 GB ceiling, so there is ~3.75 GB of headroom — real,
-   but not unlimited. `mt_ppo`'s episodes previously tripled in length during training; the search
-   penalty should now prevent that, but verify rather than assume.
+   Measured at 100 steps: `ppo` 0%, `ppo_mr` 1%, `mt_ppo` 0%. Peak memory reaches 23.0-23.5 GB
+   against a ~23.5 GB ceiling once episodes have grown, so headroom is thin.
+   **If the rate climbs above ~5%, or diverges sharply between arms, stop** — unequal real
+   gradient-update counts are what invalidated Phase 7b (431 vs 499).
+   **The fix is to chunk the critic forward pass** (`_forward_critic_values`, the last remaining
+   unchunked memory term, ~1.5 GB — `gather_action_logprobs` is the worked example to copy).
+   **Do NOT shrink `num_rollouts_per_step`**: that is the paper's "total batch size" (ours 4, the
+   paper's 512), so shrinking it degrades gradient quality and widens the largest documented
+   deviation, to fix a peak actually driven by a single long episode.
 2. **`ended_on_tool` must stay 0.** It is logged per episode in `train_log.jsonl`. A nonzero rate
    means the answer-turn defect has regressed.
 3. **Format compliance must rise.** If `mt_ppo` is still near 0.5 at step 150, stop — the paper
@@ -205,6 +229,30 @@ healthy rates. It fired three times on a healthy run. Treat it as noise; use the
 instead. Recalibrating it is an open task.
 
 ---
+
+## 6a. What this phase can and cannot claim
+
+This matters for the write-up; do not overstate it.
+
+| Comparison | Valid? |
+|---|---|
+| `ppo` vs `ppo_mr` vs `mt_ppo` | **Yes.** Identical in every hyperparameter; only the reward components and their placement differ. This is the phase's real result. |
+| MT-PPO vs the paper's Table 2 (EM 0.453 / format 0.998, HotpotQA) | **Yes** — a genuine reproduction check, subject to the deviations in §5. |
+| GRPO-OR vs GRPO-MR (Phases 5-6) | **Yes**, independently. Those numbers stand (EM 0.242 vs 0.307). |
+| **PPO track vs GRPO track** | **No — cross-track observation only.** |
+
+The last row is the trap. The PPO track now uses the **paper's** rewards (binary or ±1.0 outcome,
+per-turn format, λs search penalty); the GRPO track uses **this repo's** rewards (±0.1 format,
+F1 + 0.5·EM outcome, 0.4 × retrieval_fraction). Those are different objectives, so any numeric
+difference between the tracks conflates the algorithm with the reward function and cannot be
+attributed to PPO-vs-GRPO. Report it as a qualitative observation with that caveat stated, or not
+at all.
+
+A genuine PPO-vs-GRPO comparison requires re-running the GRPO track under the paper's rewards
+too. **That is now Phase 7d** (`docs/phase-7d-paper-faithful-grpo.md`), scheduled to run after
+this phase and BEFORE Phase 8's judge — the paper's own Section 6.1 defines GRPO-OR/GRPO-MR
+with wording identical to PPO-OR/PPO-MR, and holding the reward fixed across algorithms is
+exactly what makes its Table 2 comparison valid. Do not start 7d as part of this phase.
 
 ## 6b. Scope — what this phase is NOT
 
