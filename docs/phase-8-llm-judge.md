@@ -1,50 +1,23 @@
 # Phase 8: LLM-as-Judge Reward (Bedrock + gpt-oss)
 
-> **Scope reframed 2026-07-26 — read this before the original Goal below.**
+> **Scope clarified 2026-07-26.** This phase reproduces the paper's judge; the interesting
+> comparison moved to Phase 8b.
 >
-> **The paper never benchmarks its judge.** Confirmed by direct fetch: Table 2 is entirely
-> deterministic rewards, and the judge appears only as training reward curves (Figure 6) on **NQ**,
-> a dataset this repo does not use. So "reproduce the judge" has no target number to hit, and as
-> originally scoped this phase could not produce a reproduction result.
+> **Know what is and is not reproducible here.** Confirmed by direct fetch: the paper never
+> benchmarks its judge. Table 2 is entirely deterministic rewards, and the judge appears only as
+> training reward curves (Figure 6) on **NQ**, a dataset this repo does not use. So there is **no
+> target EM number to hit**. What this phase can legitimately reproduce is the paper's reported
+> *training-curve stability* under judge rewards — on our HotpotQA pipeline, which is itself a
+> deviation worth stating.
 >
-> **A better framing, and a genuinely original one.** The paper's stated motivation for the judge
-> is a specific limitation of verifiable rewards (Section 5.3, verbatim):
+> Build it, smoke-test it, and confirm judge rewards produce stable optimization. Do not claim a
+> benchmark reproduction; there is nothing to reproduce against.
 >
-> > *"Verifiable rewards, such as exact match, provide a strict and objective form of evaluation.
-> > However, they can be overly rigid: an agent may produce a correct answer that differs slightly
-> > in form from the ground truth but still receives negative feedback."*
->
-> **This repo independently identified the same limitation and treated it differently.** The F1 +
-> 0.5·EM outcome reward (`rewards.outcome_reward`, Phases 2-6) exists precisely because binary
-> exact match is too rigid — the same diagnosis, patched with a cheap graded metric instead of an
-> expensive model. Nobody has compared the two treatments.
->
-> **Proposed experiment: three MT-PPO arms, differing only in how the outcome reward handles EM's
-> rigidity.**
->
-> | Arm | Outcome reward | Source |
-> |---|---|---|
-> | baseline | Binary EM (+1.0 / +0.2 / −1.0) | The paper's Table 2 — comes free from Phase 7c |
-> | judge | LLM-as-judge scoring | The paper's Section 5.3 |
-> | partial credit | F1-graded outcome | This repo's own deviation |
->
-> The question — *does an expensive LLM judge actually beat a cheap graded metric at solving the
-> same problem?* — is one the paper raises but never answers, and two of the three arms already
-> exist.
->
-> **Methodological trap to design around.** Each arm optimizes a different objective, so the
-> evaluation metric must not favour one by construction: scoring on F1 advantages the
-> partial-credit arm, scoring on judge output advantages the judge arm. Use held-out **exact
-> match** — the paper's own reported metric. If either treatment beats the baseline on EM *despite
-> not optimizing EM directly*, that is a real result rather than a tautology.
->
-> **Also weigh the costs honestly** before committing: a judge call per turn per rollout is real
-> latency and spend inside the training loop, and a policy optimizing against a model's opinion can
-> learn to produce text the judge likes without being more correct (reward hacking) — a failure
-> mode a deterministic check cannot have. Those are worth measuring, not just noting.
->
-> **Decide whether this phase earns its place after Phase 7c's five-arm results are in.** It is no
-> longer automatically committed work.
+> **The scientifically interesting question is Phase 8b** (`docs/phase-8b-full-judge-runs.md`):
+> the paper motivates the judge by exact match being "overly rigid", which is the same limitation
+> this repo's F1+EM deviation independently addressed. 8b compares those two treatments. Build
+> this phase with that comparison in mind — in particular, keep the judge reward swappable at the
+> same seam as the deterministic outcome reward, so 8b can run all three arms without rework.
 
 ## Goal
 
