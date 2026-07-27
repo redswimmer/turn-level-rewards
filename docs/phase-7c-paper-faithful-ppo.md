@@ -7,7 +7,7 @@ five full runs.** Nothing is half-finished; everything described here is committ
 
 ## STOP CONDITIONS — read before doing anything
 
-1. **Do not change the experiment.** Step count (500), eval size (full 7,405), batch
+1. **Do not change the experiment.** Step count (500), eval size (7,404 — see §3), batch
    (`num_rollouts_per_step=4`, `num_generations=8`), seed (42) and the reward design are all
    decided, with the reasoning recorded below. If you believe one is wrong, say so and stop —
    do not adjust it.
