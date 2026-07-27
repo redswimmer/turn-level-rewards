@@ -5,6 +5,8 @@ construction require a real model/chat-template, which is exactly what the live 
 (not tests/unit/) validates instead, per CLAUDE.md's Guiding principles.
 """
 
+import math
+
 import pytest
 import torch
 import torch.nn as nn
@@ -19,6 +21,7 @@ from turn_level_rewards.train_ppo import (
     compute_gae,
     compute_ppo_loss,
     gather_action_logprobs,
+    normalize_advantages,
     place_turn_rewards,
     resolve_auto_checkpoint,
     resolve_stop_token_ids,
@@ -724,3 +727,100 @@ def test_gather_action_logprobs_rejects_a_non_positive_chunk_size():
 
     with pytest.raises(ValueError, match="chunk_size"):
         gather_action_logprobs(lm_head, states, targets, chunk_size=0)
+
+
+def test_normalize_advantages_gives_zero_mean_unit_std():
+    """PPO's policy_lr is calibrated for unit-scale advantages.
+
+    This repo takes policy_lr=1e-6 straight from the paper's Appendix C.1.3, but the paper runs
+    on veRL, which normalizes advantages by default. Feeding raw advantages -- here typically
+    ~0.1-0.3, since most episodes score the -0.1 format floor -- into an LR tuned for ~1.0 makes
+    the effective step size several times smaller than intended. Normalizing restores the
+    precondition the borrowed hyperparameter assumes.
+    """
+    normalized = normalize_advantages([1.0, 2.0, 3.0, 4.0])
+
+    mean = sum(normalized) / len(normalized)
+    var = sum((x - mean) ** 2 for x in normalized) / len(normalized)
+    assert mean == pytest.approx(0.0, abs=1e-6)
+    assert var == pytest.approx(1.0, abs=1e-3)
+
+
+def test_normalize_advantages_preserves_ordering_and_sign_structure():
+    """Normalization must rescale, never reorder -- the relative ranking of actions IS the signal."""
+    raw = [-0.5, 0.1, 0.4, 2.0]
+
+    normalized = normalize_advantages(raw)
+
+    assert sorted(normalized) == normalized
+    assert normalized[0] < 0 < normalized[-1]
+
+
+def test_normalize_advantages_handles_zero_variance_without_dividing_by_zero():
+    """Every episode scoring identically is a real, observed state (it is what the 2026-07-24
+    flat-reward bug produced). It must yield zero advantage, not NaN.
+    """
+    normalized = normalize_advantages([0.3, 0.3, 0.3])
+
+    assert all(x == pytest.approx(0.0) for x in normalized)
+    assert all(math.isfinite(x) for x in normalized)
+
+
+def test_normalize_advantages_handles_a_single_value():
+    assert normalize_advantages([2.5]) == [0.0]
+
+
+def test_compute_ppo_loss_kl_term_is_non_negative_and_penalises_divergence():
+    """The KL term must PENALISE moving away from the rollout policy.
+
+    The original implementation used mean(new_logprobs - old_logprobs), which over tokens sampled
+    from the old policy estimates -KL(old||new) <= 0. Adding +kl_beta * that to the loss and
+    minimising therefore MAXIMISED divergence -- the opposite of a trust region. This pins the
+    k3 estimator (exp(d) - d - 1, d = old - new), which is non-negative by construction.
+    """
+    identical = compute_ppo_loss(
+        new_logprobs=torch.tensor([0.5, 0.5]),
+        old_logprobs=torch.tensor([0.5, 0.5]),
+        advantages=torch.zeros(2),
+        returns=torch.zeros(2),
+        new_values=torch.zeros(2),
+        action_mask=torch.ones(2),
+    )
+    diverged = compute_ppo_loss(
+        new_logprobs=torch.tensor([-1.5, 2.0]),
+        old_logprobs=torch.tensor([0.5, 0.5]),
+        advantages=torch.zeros(2),
+        returns=torch.zeros(2),
+        new_values=torch.zeros(2),
+        action_mask=torch.ones(2),
+    )
+
+    assert identical["kl"].item() == pytest.approx(0.0, abs=1e-6)
+    assert diverged["kl"].item() > 0.0
+
+
+def test_compute_ppo_loss_kl_penalty_increases_the_loss():
+    """With advantages and value error zeroed out, a diverging policy must score a HIGHER loss
+    than a matching one -- that is what makes the term a penalty rather than a reward.
+    """
+    zeros, ones = torch.zeros(2), torch.ones(2)
+    matched = compute_ppo_loss(
+        new_logprobs=torch.tensor([0.5, 0.5]),
+        old_logprobs=torch.tensor([0.5, 0.5]),
+        advantages=zeros,
+        returns=zeros,
+        new_values=zeros,
+        action_mask=ones,
+        kl_beta=1.0,
+    )
+    diverged = compute_ppo_loss(
+        new_logprobs=torch.tensor([-1.0, 1.5]),
+        old_logprobs=torch.tensor([0.5, 0.5]),
+        advantages=zeros,
+        returns=zeros,
+        new_values=zeros,
+        action_mask=ones,
+        kl_beta=1.0,
+    )
+
+    assert diverged["loss"].item() > matched["loss"].item()

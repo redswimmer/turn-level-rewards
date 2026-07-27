@@ -424,7 +424,17 @@ def compute_ppo_loss(
     clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
     policy_loss = -_masked_mean(torch.min(unclipped, clipped), action_mask)
     value_loss = _masked_mean((new_values - returns) ** 2, action_mask)
-    kl = _masked_mean(new_logprobs - old_logprobs, action_mask)
+    # Schulman's k3 estimator: exp(d) - d - 1 with d = old - new. Non-negative by construction,
+    # low variance, and the same estimator TRL's GRPO uses.
+    #
+    # The original implementation used mean(new_logprobs - old_logprobs) directly. Over tokens
+    # sampled from the OLD policy that expectation is -KL(old||new) <= 0, so adding
+    # +kl_beta * it to the loss and minimising MAXIMISED divergence from the rollout policy --
+    # the exact opposite of the trust region the term is documented to provide. kl_beta=0.001
+    # kept the magnitude small, but the sign was backwards, leaving PPO with no trust region
+    # beyond clipping plus a slight push away from it.
+    log_ratio_reversed = old_logprobs - new_logprobs
+    kl = _masked_mean(torch.exp(log_ratio_reversed) - log_ratio_reversed - 1.0, action_mask)
     loss = policy_loss + value_loss_coef * value_loss + kl_beta * kl
 
     # Diagnostic-only fields (no gradient contribution) -- mirror TRL's own PPOTrainer metric
@@ -628,7 +638,23 @@ class MTPPOTrainer(Trainer):
         retrieval_fraction_after_each_turn: list[float] = []
         num_action_tokens = 0
 
-        for _turn in range(self.args.n_max):  # ty: ignore[unresolved-attribute]
+        # n_max + 1 generations for n_max tool rounds, so the policy ALWAYS gets one final turn
+        # after its last tool result in which to answer.
+        #
+        # The original loop was `for _turn in range(n_max)` with tool execution at the end of
+        # each pass, which meant a model that called a tool on the last pass had its tool
+        # executed and the episode then ended on a `role: tool` message -- no generation left in
+        # which to produce an <answer>, and a -0.1 format penalty for a turn it was never given.
+        # Measured over every logged episode: 58% of ppo and 21% of mt_ppo episodes ended that
+        # way, structurally unable to answer.
+        #
+        # This also made the PPO track incomparable to the GRPO track it is being measured
+        # against. TRL's GRPOTrainer._tool_call_loop runs `while tool_calls and iteration_num <
+        # max`, executing tools and THEN generating (grpo_trainer.py: tool message appended,
+        # then _generate_single_turn, then iteration_num += 1) -- so at the same nominal
+        # max_tool_calling_iterations=4, GRPO's conversations always end on a generation and
+        # ours could not. Verified in TRL's source, not assumed from documentation.
+        for _turn in range(self.args.n_max + 1):  # ty: ignore[unresolved-attribute]
             prompt_text = self.tokenizer.apply_chat_template(
                 messages,
                 tools=[environment.search],
@@ -684,6 +710,12 @@ class MTPPOTrainer(Trainer):
             tool_calls = parsed.get("tool_calls") or []
             if not tool_calls:
                 break  # final answer turn -- episode complete
+            if _turn == self.args.n_max:  # ty: ignore[unresolved-attribute]
+                # Tool budget exhausted. Stop WITHOUT executing this turn's calls: the episode
+                # already ends on a generation (the guarantee above), and running a tool whose
+                # result no turn can ever read would only add unattributable tokens. Matches
+                # TRL, whose loop likewise leaves the final turn's calls unexecuted.
+                break
 
             for tool_call in tool_calls:
                 # A real failure Task 13's live smoke test caught: an untrained (or
@@ -882,6 +914,8 @@ class MTPPOTrainer(Trainer):
         smoke test (Task 11).
         """
         episodes = []
+        raw_advantages: list[list[float]] = []
+        device = self.model.policy.device  # ty: ignore[unresolved-attribute]
         for row in rows:
             rollout = self._rollout_episode(row)
 
@@ -916,8 +950,14 @@ class MTPPOTrainer(Trainer):
                 gamma=self.args.gamma,  # ty: ignore[unresolved-attribute]
                 lam=self.args.gae_lambda,  # ty: ignore[unresolved-attribute]
             )
+            # returns deliberately use the RAW advantages: returns are the critic's regression
+            # target (the actual discounted return), so normalizing them would train the critic
+            # to predict a rescaled quantity that no longer matches the rewards it is supposed
+            # to estimate. Only the policy-loss advantages get normalized, below, across the
+            # whole batch.
             returns = [a + v for a, v in zip(advantages, old_values.tolist(), strict=True)]
 
+            raw_advantages.append(advantages)
             episodes.append(
                 {
                     "full_token_ids": rollout["full_token_ids"],
@@ -931,8 +971,22 @@ class MTPPOTrainer(Trainer):
                     "retrieval_fraction": retrieval_fraction,
                     "question": row["question"],
                     "completion": completion,
+                    "turn_boundary_action_indices": rollout["turn_boundary_action_indices"],
                 }
             )
+
+        # Normalized ACROSS THE WHOLE BATCH, not per episode. Per-episode normalization would
+        # force every episode's advantages to zero mean, erasing the between-episode difference
+        # that says "this rollout was better than that one" -- which is most of the signal when
+        # the reward is dominated by a terminal outcome term.
+        normalized = normalize_advantages([a for episode in raw_advantages for a in episode])
+        offset = 0
+        for episode, raw in zip(episodes, raw_advantages, strict=True):
+            episode["advantages"] = torch.tensor(
+                normalized[offset : offset + len(raw)],
+                device=device,  # ty: ignore[invalid-argument-type]
+            )
+            offset += len(raw)
         return episodes
 
     def _ppo_update(self, episodes: list[dict]) -> dict[str, float]:
@@ -1041,6 +1095,15 @@ class MTPPOTrainer(Trainer):
                     + self.args.kl_beta * real_kl  # ty: ignore[unresolved-attribute]
                 ).item()
                 num_updates += 1
+
+            # Standard PPO practice, and absent until now. Gradients here are accumulated across
+            # every episode in the batch with no bound on their norm, so a single outlier episode
+            # (this repo's action-token counts reach 3,000+ against a median of ~150) can drive
+            # one update far outside the region the clipped surrogate is meant to keep the policy
+            # in. That is a textbook cause of exactly the failure observed on 2026-07-25: ppo's
+            # format compliance fell from 0.542 at step 399 to 0.120 by step 500.
+            # max_grad_norm comes from TrainingArguments (default 1.0), so no new config field.
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)  # ty: ignore[unresolved-attribute]
             # self.optimizer is Optional on Trainer's base class for the same reason noted
             # above this method's self.optimizer.zero_grad() call; still provably a real
             # Optimizer at this point in the loop.
@@ -1362,6 +1425,16 @@ class MTPPOTrainer(Trainer):
                     "format_and_outcome_reward": episode["format_and_outcome_reward"],
                     "retrieval_fraction": episode["retrieval_fraction"],
                     "num_action_tokens": len(episode["old_values"]),
+                    # Turn accounting, logged because reconstructing it from the 1-in-10
+                    # sampled transcripts was not enough to measure the 2026-07-26 answer-turn
+                    # defect -- where an episode that used its whole tool budget ended on a
+                    # role:tool message with no generation left in which to answer, and was then
+                    # penalised for not answering. ended_on_tool must now be False for every
+                    # episode; a nonzero rate means that regression is back.
+                    "num_tool_turns": len(episode["turn_boundary_action_indices"]),
+                    "ended_on_tool": episode["completion"][-1].get("role") == "tool"
+                    if episode["completion"]
+                    else False,
                 }
                 for episode in episodes
             ]
@@ -1417,6 +1490,34 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "latest checkpoint under this run's output_dir.",
     )
     return parser.parse_args(argv)
+
+
+def normalize_advantages(advantages: list[float]) -> list[float]:
+    """Rescale advantages to zero mean and unit variance.
+
+    Standard PPO practice, and not optional here: this repo takes policy_lr=1e-6 directly from
+    the paper's Appendix C.1.3, but the paper runs on veRL, which normalizes advantages by
+    default. A learning rate calibrated for unit-scale advantages applied to raw ones -- here
+    typically ~0.1-0.3, because most episodes score the -0.1 format floor and gamma=lambda=1
+    makes every token's advantage R_total - V(t) -- yields an effective step size several times
+    smaller than the paper's. Copying the hyperparameter without its precondition is what made
+    the two incomparable.
+
+    Rescales only; it never reorders. The relative ranking of actions IS the learning signal, so
+    a transform that changed it would change the algorithm rather than its conditioning.
+
+    Zero variance returns all-zero rather than dividing by ~0. That state is real, not
+    hypothetical -- it is exactly what the 2026-07-24 flat-reward bug produced for 177 steps --
+    and NaN advantages would poison every subsequent update rather than simply carrying no
+    signal, which is the honest representation of a batch in which nothing differed.
+    """
+    count = len(advantages)
+    mean = sum(advantages) / count
+    variance = sum((a - mean) ** 2 for a in advantages) / count
+    std = math.sqrt(variance)
+    if std < 1e-8:
+        return [0.0] * count
+    return [(a - mean) / std for a in advantages]
 
 
 def gather_action_logprobs(lm_head, hidden_states, next_tokens, chunk_size=LOGPROB_CHUNK_SIZE):
