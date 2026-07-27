@@ -113,15 +113,18 @@ ours:   500 steps x   4 batch =   2,000 episodes    (128x less data)
 ```
 
 Matching data volume would require ~64,000 steps (~250 hours) and is not viable, so 500 matches
-their **update count**, not their data. **Run 500 first** — it is the paper's number and a real
-anchor, and deviating on step count as well as batch size compounds deviations.
+their **update count**, not their data. **Run 500. This is decided, not open** — it is the paper's
+number, matching more steps to compensate for the smaller batch is not viable at ~250 hours, and
+deviating on step count as well as batch size would compound deviations. Do not change it.
 
 **But expect it may be undertrained, and check rather than assume.** At 100 steps `ppo_mr`'s
 format compliance was still climbing (0.61 → 0.83), and Phase 6 hit exactly this on the GRPO
 track: 300 steps were inconclusive and 600 resolved it. Apply Phase 6's "is more training
-needed?" checklist at 500 — if the curves have not plateaued, extend and say so in the write-up.
-Doubling to 1,000 steps costs roughly 21 h across all five arms (500 steps is ~10.5 h total:
-PPO 1.7 / 3.5 / 3.0 h, GRPO ~1.6 / 0.7 h).
+needed?" checklist at 500 and **report the answer to the user** — do not extend on your own
+initiative. If the curves have not plateaued, that is a finding to raise along with the results,
+and the write-up should state that 500 steps at batch 4 may leave the arms undertrained. For
+reference if the user asks: doubling to 1,000 steps costs roughly 21 h across all five arms
+(500 steps is ~10.5 h total: PPO 1.7 / 3.5 / 3.0 h, GRPO ~1.6 / 0.7 h).
 
 Note that more steps at a tiny batch is NOT equivalent to fewer steps at a large one — the
 gradients stay noisy, so it buys more updates of lower quality, with more exposure to the PPO
