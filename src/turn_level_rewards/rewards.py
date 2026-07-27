@@ -281,3 +281,91 @@ def paper_turn_reward(
     reward = PAPER_RETRIEVAL_BONUS if found_gold else 0.0
     reward += PAPER_TURN_FORMAT_BONUS if format_ok else PAPER_TURN_FORMAT_PENALTY
     return reward - search_penalty_weight * cumulative_searches
+
+
+def paper_grpo_outcome_reward(
+    completions: list[Completion],
+    golden_answers: list[list[str]],
+    log_metric: LogMetric = _noop_log_metric,
+    **kwargs: Any,
+) -> list[float]:
+    """GRPO-OR's reward: binary final-answer correctness, per Section 6.1.
+
+    Section 6.1 defines GRPO-OR word-for-word identically to PPO-OR -- "vanilla GRPO trained with
+    only outcome rewards, where the trajectory-level reward is a binary signal indicating
+    final-answer correctness". Holding the reward design fixed across algorithms is exactly what
+    makes the paper's Table 2 cross-algorithm comparison valid, which this repo's own GRPO
+    rewards broke.
+
+    KNOWN RISK, to be measured rather than assumed. GRPO's advantage is group-relative:
+    (reward - group mean) / group std. If every rollout of a prompt scores identically, std is 0
+    and that prompt contributes NO gradient. A binary reward makes that likely early in training,
+    when a 0.8B model rarely answers a 2-hop question exactly right. That risk is the stated
+    reason this repo originally deviated to F1+EM -- but it was a design-time prediction that was
+    never tested, and locking it in without measuring is what cost the five-arm comparison.
+    TRL's GRPOTrainer logs frac_reward_zero_std; watch it. Pinned at 1.0 means no learning
+    signal, which would be a real finding about this scale, not a bug.
+    """
+    rewards = []
+    for completion, answers in zip(completions, golden_answers, strict=True):
+        reward = paper_binary_outcome_reward(completion, answers)
+        rewards.append(reward)
+        log_metric("exact_match", reward)
+        log_metric(
+            "format_compliance_rate", 1.0 if _extract_answer(completion) is not None else 0.0
+        )
+    return rewards
+
+
+def paper_grpo_merged_reward(
+    completions: list[Completion],
+    golden_answers: list[list[str]],
+    environments: list[Any] | None = None,
+    log_metric: LogMetric = _noop_log_metric,
+    **kwargs: Any,
+) -> list[float]:
+    """GRPO-MR's reward: the paper's R^O plus retrieval correctness, as ONE trajectory-level
+    scalar (Section 6.1: "the trajectory-level reward combines intermediate rewards (retrieval
+    correctness) and outcome rewards (answer correctness and format correctness)").
+
+    Trajectory-level by construction: GRPO scores one scalar per completed rollout and has no
+    per-timestep value function, so there is nowhere to place a per-turn reward. That is the
+    structural reason MT-GRPO needs its own advantage estimator (out of scope, see CLAUDE.md) and
+    why GRPO-MR is the correct GRPO analogue of PPO-MR rather than of MT-PPO.
+
+    Retrieval is scored with the paper's +0.3 weight against the episode's final
+    retrieval_fraction. The search penalty is deliberately NOT applied: the paper introduces
+    lambda_s as part of the per-turn R^I for MT-PPO, and Phase 6 already measured that borrowing
+    it into GRPO HURT both conditions (see docs/phase-6-evaluation-comparison.md).
+    """
+    outcomes = [
+        paper_outcome_reward(completion, answers)
+        for completion, answers in zip(completions, golden_answers, strict=True)
+    ]
+    if environments is None:
+        environments = [None] * len(completions)
+
+    rewards = []
+    for completion, outcome, environment in zip(completions, outcomes, environments, strict=True):
+        retrieval_fraction = getattr(environment, "retrieval_fraction", 0.0)
+        rewards.append(outcome + PAPER_RETRIEVAL_BONUS * retrieval_fraction)
+        log_metric("retrieval_fraction", retrieval_fraction)
+        log_metric(
+            "format_compliance_rate", 1.0 if _extract_answer(completion) is not None else 0.0
+        )
+    return rewards
+
+
+def get_paper_reward_funcs(condition: Literal["grpo_or", "grpo_mr"]) -> list[Any]:
+    """Paper-faithful GRPO reward functions (Section 6.1), for the five-arm comparison.
+
+    Kept separate from get_reward_funcs rather than folded into it: the existing
+    outcome_only/turn_level conditions are a real, completed, held-out-confirmed experiment
+    (Phases 5-6) under this repo's own reward design, and changing what those names mean would
+    silently invalidate results already written up.
+    """
+    if condition == "grpo_or":
+        return [paper_grpo_outcome_reward]
+    if condition == "grpo_mr":
+        return [paper_grpo_merged_reward]
+    raise ValueError(f"unknown paper GRPO condition: {condition}")

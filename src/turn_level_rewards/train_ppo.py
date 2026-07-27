@@ -291,7 +291,9 @@ class MTPPOConfig(TrainingArguments):
     save_steps: int = 50
     save_total_limit: int = 3
     max_completion_length: int = 2048
-    project: str = "turn-level-rewards-ppo"
+    # Shared with the paper-faithful GRPO arms (train.py) so all five overlay in one
+    # dashboard. All three PPO arms use the paper's reward design as of Phase 7c.
+    project: str = "turn-level-rewards-paper"
 
 
 def build_ppo_config(

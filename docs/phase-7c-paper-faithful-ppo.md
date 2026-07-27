@@ -1,7 +1,9 @@
-# Phase 7c: Paper-faithful PPO — PPO-OR vs PPO-MR vs MT-PPO
+# Phase 7c: Paper-faithful five-arm comparison
+
+**PPO-OR · PPO-MR · MT-PPO · GRPO-OR · GRPO-MR — all under the paper's own reward design.**
 
 **Status**: implementation complete, smoke-tested, verified to 100 steps. **Ready to launch the
-three full runs.** Nothing is half-finished; everything described here is committed.
+five full runs.** Nothing is half-finished; everything described here is committed.
 
 **Read this document first and in full.** It is self-contained: you do not need to read the
 Phase 7b history to execute it. Read `CLAUDE.md` for repo-wide context (model, dataset,
@@ -56,14 +58,27 @@ is the paper's actual contribution.
 
 ## 2. The experiment
 
-Three arms, **seed 42**, 500 steps each. Identical in every hyperparameter; they differ only in
-which reward components exist and where they land.
+Five arms, **all at seed 42**, 500 steps each. Within each track every hyperparameter is
+identical; arms differ only in which reward components exist and where they land.
 
-| Arm | Paper's definition (§6.1, verbatim) | Implementation |
-|---|---|---|
-| `ppo` (**PPO-OR**) | *"vanilla PPO trained with only outcome rewards, where the trajectory-level reward is a binary signal indicating final-answer correctness"* | `paper_binary_outcome_reward` (1.0/0.0, **no format term**) at the last token |
-| `ppo_mr` (**PPO-MR**) | *"...merged intermediate and outcome rewards, where the trajectory-level reward combines intermediate rewards (retrieval correctness) and outcome rewards (answer correctness and format correctness)"* | `R^O + sum(R^I)`, **all** at the last token |
-| `mt_ppo` (**MT-PPO**) | Same components, turn-level placement via Eq. 9, λs = 0.1 | `R^I` at each intermediate turn boundary, `R^O` at the last token |
+| Arm | Trainer | Paper's definition (§6.1, verbatim) | Implementation |
+|---|---|---|---|
+| `ppo` (**PPO-OR**) | `MTPPOTrainer` | *"vanilla PPO trained with only outcome rewards, where the trajectory-level reward is a binary signal indicating final-answer correctness"* | `paper_binary_outcome_reward` (1.0/0.0, **no format term**) at the last token |
+| `ppo_mr` (**PPO-MR**) | `MTPPOTrainer` | *"...merged intermediate and outcome rewards, where the trajectory-level reward combines intermediate rewards (retrieval correctness) and outcome rewards (answer correctness and format correctness)"* | `R^O + sum(R^I)`, **all** at the last token |
+| `mt_ppo` (**MT-PPO**) | `MTPPOTrainer` | Same components, turn-level placement via Eq. 9, λs = 0.1 | `R^I` at each intermediate turn boundary, `R^O` at the last token |
+| `grpo_or` (**GRPO-OR**) | TRL `GRPOTrainer` | *"vanilla GRPO trained with only outcome rewards, where the trajectory-level reward is a binary signal indicating final-answer correctness"* | `paper_grpo_outcome_reward` (1.0/0.0) |
+| `grpo_mr` (**GRPO-MR**) | TRL `GRPOTrainer` | *"...merged intermediate and outcome rewards..."* (same wording as PPO-MR) | `paper_grpo_merged_reward`: `R^O + 0.3 × retrieval_fraction`, one trajectory-level scalar |
+
+**The GRPO arms need no custom trainer.** They are reward-function changes only, so TRL's
+`GRPOTrainer` handles them natively — much lower risk than the hand-built `MTPPOTrainer`. (MT-GRPO
+*would* need a custom trainer, which is why `CLAUDE.md` scopes it out: TRL exposes no hook for
+per-turn advantage estimation.)
+
+**Why five arms and not three**: holding the reward design fixed across algorithms is exactly what
+makes the paper's Table 2 cross-algorithm comparison valid — §6.1 defines GRPO-OR/GRPO-MR with
+wording identical to PPO-OR/PPO-MR. This repo's earlier GRPO track (Phases 5-6) used its own
+reward design, so those runs cannot join this table. They are kept as record, not as a result
+here.
 
 **Why PPO-MR matters**: `ppo → ppo_mr` isolates the value of the added reward signal;
 `ppo_mr → mt_ppo` isolates the value of turn-level placement. Without MR the comparison changes
@@ -105,16 +120,34 @@ curl -s -X POST http://localhost:8000/retrieve -H 'Content-Type: application/jso
 
 If it is not running, see `docs/phase-1-retrieval-infra.md` for the launch command.
 
-### Training (~4-6 h total, sequential — the GPU fits one run at a time)
+### Training (sequential — the GPU fits one run at a time)
+
+The two tracks use different entry points: PPO arms go through `train_ppo` (the hand-built
+`MTPPOTrainer`), GRPO arms through `train` (TRL's `GRPOTrainer`).
 
 ```bash
+# PPO arms  (~1.7 / 3.5 / 3.0 h respectively, measured at 100 steps and extrapolated)
 for C in ppo ppo_mr mt_ppo; do
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     .venv/bin/python -m turn_level_rewards.train_ppo \
       --condition $C --train-size 90447 --max-steps 500 \
       --num-rollouts-per-step 4 --save-steps 50 --seed 42
 done
+
+# GRPO arms
+for C in grpo_or grpo_mr; do
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    .venv/bin/python -m turn_level_rewards.train \
+      --condition $C --train-size 90447 --eval-size 8 --max-steps 500 \
+      --num-generations 8 --seed 42
+done
 ```
+
+`--num-generations 8` is the GRPO group size, and the verification runs used the same value —
+keep them matched. It is *not* the analogue of `--num-rollouts-per-step`: GRPO samples one prompt
+many times to build its group baseline, while PPO draws distinct prompts and uses a learned
+critic. So the two tracks' batch settings are not directly comparable and should not be forced to
+match.
 
 Run it under `systemd-run --user --scope --unit=<name> bash -c "..."`. A transient systemd cgroup
 has killed long-running processes on this machine before (documented in
