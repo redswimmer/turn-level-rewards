@@ -102,6 +102,21 @@ def build_config(
         gradient_accumulation_steps=num_generations // train_micro_batch_size,
         max_tool_calling_iterations=4,
         beta=0.0,
+        # 8-bit AdamW optimizer states, matching the PPO track (train_ppo.py's
+        # use_8bit_optimizer). Two reasons, both load-bearing:
+        #
+        # Consistency: having the PPO arms on 8-bit and the GRPO arms on fp32 would be another
+        # silent asymmetry between tracks that are supposed to be comparable -- exactly the
+        # class of unexamined difference that cost this project its five-arm comparison once
+        # already.
+        #
+        # Memory: a 100-step verification run at num_generations=8 peaked at 23.3 GB against a
+        # ~23.5 GB card. Unlike MTPPOTrainer, TRL's GRPOTrainer has no catch-OOM-and-skip
+        # path, so an OOM here is a hard crash mid-run rather than a skipped step. beta=0.0
+        # means no reference model, so the optimizer holds state for a single 0.8B policy:
+        # AdamW keeps two fp32 states per parameter (~6.4 GB), quantized to ~1.6 GB here.
+        # Measured on a real 100-step run: peak 23.3 GB -> 19.7 GB.
+        optim="adamw_bnb_8bit",
         max_completion_length=2048,
         logging_steps=1,
         logging_nan_inf_filter=False,
