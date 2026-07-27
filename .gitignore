@@ -15,5 +15,5 @@ data/
 # Training checkpoints
 outputs/
 
-# Evaluation outputs (regenerated per run; see docs/phase-7c-paper-faithful-ppo.md)
-results/
+# Agent run logs (regenerable; the durable record is outputs/<arm>/train_log.jsonl)
+logs/

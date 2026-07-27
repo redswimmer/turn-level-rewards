@@ -382,8 +382,13 @@ but they must be stated in any write-up, alongside the pre-existing ones in `CLA
 
 ## 6. Gates — stop and investigate rather than burning 15 hours
 
+**Fastest way to check all four gates at once:**
+`.venv/bin/python scripts/check_gates.py outputs/<arm>/train_log.jsonl` — reports exactly these
+four quantities and nothing else. `analyze_train_log.py` still exists for episode-level
+forensics, but it buries the gate numbers under ~60 lines of outlier detail.
+
 1. **Skip rate must stay low and SYMMETRIC.** Check at step ~100 and again at ~300:
-   `.venv/bin/python scripts/analyze_train_log.py outputs/<arm>/train_log.jsonl`
+   `.venv/bin/python scripts/check_gates.py outputs/<arm>/train_log.jsonl`
    Measured at 100 steps: `ppo` 0%, `ppo_mr` 1%, `mt_ppo` 0%. Peak memory reaches 23.0-23.5 GB
    against a ~23.5 GB ceiling once episodes have grown, so headroom is thin.
    **If the rate climbs above ~5%, or diverges sharply between arms, stop** — unequal real
