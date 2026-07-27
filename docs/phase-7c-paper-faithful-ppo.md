@@ -225,7 +225,7 @@ All on the real model, real retrieval server, RTX 4090:
 | Eval path, all three arms | train → checkpoint → sharded eval → metrics, exit 0 |
 | Hyperparameters identical across arms | verified programmatically, including 8-bit |
 
-### 100-step verification, all three arms (completed before handoff)
+### 100-step verification, all five arms (completed before handoff)
 
 ```
 arm      steps  skip  peakGPU  endedOnTool   format compliance    tools/ep  rewardVals
@@ -238,9 +238,35 @@ mt_ppo     100    0    23.0GB     0/400      0.78 → 0.80            1.69      
 Wall-clock: `ppo` 20 min, `ppo_mr` 42 min, `mt_ppo` 36 min per 100 steps — so budget roughly
 **1.7 / 3.5 / 3.0 hours** for the 500-step runs.
 
+```
+arm       steps  exit  peakGPU  zero_std (1st half -> 2nd)  errors  wall-clock
+grpo_or     100     0   20.5GB  0.50  (0.48 -> 0.52)             0     19 min
+grpo_mr     100     0   20.5GB  0.36  (0.36 -> 0.36)             0      8 min
+```
+
 `*` PPO-OR's reward is binary correctness with no format term, so `format_and_outcome_reward`
 cannot distinguish "wrong answer" from "no answer". `format_ok` is now logged per episode
-(commit `b94b9c5`) and will be measurable for all three arms in the real runs.
+(commit `b94b9c5`) and will be measurable for all arms in the real runs.
+
+**The GRPO zero-variance measurement — the assumption this project was built on.** GRPO's
+gradient comes entirely from within-group reward variance; `frac_reward_zero_std` is the fraction
+of prompt-groups where every rollout scored identically and therefore contributed nothing. This
+repo deviated from the paper's binary reward at Phase 2 on the *prediction* that binary rewards
+would starve GRPO, and never measured it. Measured now:
+
+- `grpo_or` (binary EM only): **0.50** — half of all groups produce no gradient, and it does not
+  improve over 100 steps (0.48 → 0.52).
+- `grpo_mr` (+ retrieval reward): **0.36** — the continuous retrieval term restores gradient on
+  groups a binary signal left dead.
+
+So the original instinct was **directionally correct but materially overstated**: binary rewards
+cost roughly half the gradient signal, they do not eliminate it. This also explains the paper's
+own GRPO-OR/GRPO-MR gap (0.331 → 0.416) mechanically — the merged reward is not merely adding
+information, it is reviving groups that had none.
+
+Both arms trained cleanly at 8-bit: exit 0, zero errors, 20.5 GB peak against a ~23.5 GB ceiling
+(down from 23.3 GB at fp32 — worth keeping, since TRL's GRPOTrainer has no catch-OOM-and-skip
+path and an OOM there is a hard crash, not a skipped step).
 
 **Read this honestly**: `ended_on_tool` held at 0 across all 1,196 episodes, format compliance is
 far above the pre-fix ~0.48 and rising for `ppo_mr`, and reward has genuine variance. But peak
