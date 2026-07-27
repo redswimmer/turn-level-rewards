@@ -1817,6 +1817,27 @@ def build_ppo_trainer(
 
     from turn_level_rewards import data
 
+    # Seed BEFORE building the model, not only inside train(). The critic is created by
+    # AutoModelForSequenceClassification.from_pretrained, whose score.weight has no pretrained
+    # values and is randomly initialized ("score.weight | MISSING | newly initialized" in the
+    # startup log). MTPPOTrainer.train() calls set_seed(self.args.seed), but that runs long after
+    # this line, so the critic head was outside --seed's control entirely: two runs at the same
+    # seed got different critics.
+    #
+    # Confirmed empirically, not inferred -- building the critic twice without seeding gives
+    # score.weight [0.026378, 0.000129, ...] then [0.053903, -0.003120, ...]; seeding first gives
+    # identical values both times. It also matches what the runs showed: step 0 with an identical
+    # prompt produced identical reward and retrieval_fraction (policy rollouts happen after
+    # set_seed, so they were controlled) but different loss (14.16 vs 9.78, purely the critic),
+    # and the runs diverged from step 1 onward.
+    #
+    # This invalidates the Phase 7 handoff claim, quoted in CLAUDE.md, that same-seed runs
+    # "reproduce exactly" -- that held only for the metrics that happened to be seeded.
+    #
+    # It matters most for exactly the comparison this repo is trying to make: the paper's
+    # MT-PPO-over-PPO-MR effect is +1.7 EM points and already marginal at one seed, so an
+    # uncontrolled noise source that --seed does not pin is precisely what could swamp it.
+    set_seed(config.seed)
     model = build_policy_and_critic(MODEL_NAME)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     train_dataset = data.load_train_dataset(n=train_size, seed=config.seed)
