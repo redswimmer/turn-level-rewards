@@ -621,3 +621,61 @@ seed, and the only real remedy for that is multiple seeds with paired comparison
 **So the standard for this phase is: the seed controls initialization and data order, and
 trajectories are not reproducible.** State that plainly in the write-up alongside the other
 deviations. Do not spend further time chasing bit-identity.
+
+---
+
+## 12. The `ppo` (PPO-OR) collapse — investigated 2026-07-27, do not re-run this arm
+
+The first `ppo` run collapsed and then OOM-skipped 100% of steps from ~140 onward. **It is a
+result, not a failure to retry.** Do not re-run `ppo`. Evaluate its preserved checkpoints instead.
+
+**What happened, in causal order** (from `outputs/ppo/train_log.jsonl`, 160 steps):
+
+1. PPO-OR has **λs = 0 by the paper's own definition** — Section 6.1 gives it outcome reward
+   only, so `paper_binary_outcome_reward` carries no format term and no R^I is placed. That is
+   exactly the configuration the paper warns of: *"removing this reward term leads to unstable
+   training and degenerate behaviors, such as uncontrolled search usage."*
+2. Reward went identically 0 after step 46, format compliance 0.247 → 0.009. Binary reward → all
+   zeros → critic learns V=0 → advantage 0 → **zero gradient**. An absorbing state; nothing
+   recovers from it.
+3. The degenerate policy then generated enormous completions. This is the measured driver:
+
+   ```
+   window    mean_action_tok   max    mean_maxalloc_GB
+    40- 59        182          569         15.89
+    80- 99        174          932         16.22
+   100-119        736         4198         18.00
+   120-139       2197         4249         20.55      <- 12x the baseline
+   ```
+4. Memory demand followed episode size past the card's capacity, and skips became continuous.
+
+**The reserved-memory pinning is a consequence, not a cause.** `gpu_reserved_gb` sits at ~24.2 GB
+after the first OOM while `gpu_allocated_gb` returns cleanly to 9.29 GB every step — that is the
+caching allocator holding memory it genuinely needed for 24 GB peaks, not a leak and not
+fragmentation poisoning the run. There is no memory bug to fix here. (Note `reset_peak_memory_stats()`
+IS called per step at `train_ppo.py:1419`, so `gpu_max_allocated_gb` is a per-step peak.)
+
+**Why the other four arms are not at the same risk.** `ppo_mr` and `mt_ppo` carry λs = 0.1 and the
+per-turn format reward, which hold them at ~1.6 tool turns against `ppo`'s 4.0 — they cannot drift
+into unbounded search. Note that `ppo` had the *lowest* peak memory of the three arms at step 100
+(18.21 GB vs 23.54 / 22.97), so peak memory at 100 steps predicts nothing; the collapse is what
+drove its memory, not the reverse. The GRPO arms use a different trainer entirely.
+
+They are still tight — 22.97-23.54 GB peak against a 24.56 GB card — so §6's gate 1 remains a real
+check, and §6's named remedy (chunk `_forward_critic_values`) remains the fix if it trips. Do not
+apply it pre-emptively; `ppo_mr` took only 1 skip in 100 verification steps.
+
+**Preserved, evaluate these rather than re-training:**
+- `outputs/_precollapse/ppo/checkpoint-50` — last checkpoint before collapse
+- `outputs/ppo/checkpoint-100` — post-collapse-onset
+
+This matches the paper's stated methodology for its own crashed PPO baselines: *"we evaluate them
+using either the final checkpoint or the last checkpoint prior to collapse."*
+
+**For the write-up, state the severity gap honestly**: the paper's PPO-OR still reaches EM 0.435 /
+format 0.916, so a total collapse is more severe than theirs. The most plausible cause is the
+documented batch-size deviation — at 512 episodes per update a sparse binary reward still yields
+usable gradient, while at 4 an all-zero stretch gives literally zero gradient and the policy
+random-walks into the absorbing state. That makes our PPO-OR a weaker baseline than the paper's,
+which must be said when interpreting the `ppo → ppo_mr` delta: it will measure "the baseline died",
+not "the merged reward helps by X". In the paper that delta is +0.001.
