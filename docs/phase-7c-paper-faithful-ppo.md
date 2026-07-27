@@ -102,10 +102,41 @@ R^O (final turn):
 `retrieval_fraction` only ever grows, so "ground truth in results" for *this* turn means the
 fraction rose during it.
 
-### Anchor target
+### Anchor targets — the paper's Table 2, HotpotQA
 
-Paper's MT-PPO on HotpotQA (Table 2): **EM 0.453, format correctness 0.998**. This is the number
-to judge success against. Phase 7b's MT-PPO was EM 0.123 / format ~0.48.
+| Arm | EM | Format correctness |
+|---|---|---|
+| GRPO-OR | 0.331 | 0.513 |
+| GRPO-MR | 0.416 | (not listed) |
+| PPO-OR | 0.435 | 0.916 |
+| PPO-MR | 0.436 | (not listed) |
+| **MT-PPO** | **0.453** | **0.998** |
+
+Phase 7b's MT-PPO was EM 0.123 / format ~0.48 — far off, which is what prompted this phase.
+
+**Read the effect sizes before interpreting results.** They are very unequal, and this determines
+what these runs can and cannot show:
+
+| Comparison | Paper's gap | Realistically detectable here? |
+|---|---|---|
+| GRPO-OR → GRPO-MR | **+8.5 pts** | Yes |
+| PPO-OR vs GRPO-OR | **+10.4 pts** | Yes |
+| PPO-OR → PPO-MR | +0.1 pts | No — it is ~zero in the paper too |
+| PPO-MR → MT-PPO (**the paper's own claim**) | **+1.7 pts** | **Probably not at n=1 seed** |
+
+At a 2,000-row eval the standard error on EM is ~1 point, so a 1.7-point gap is ~1.2 SE — not
+separable from noise with one seed, before even accounting for the extra gradient noise from a
+batch of 4 versus the paper's 512. **Do not report a null MT-PPO-vs-PPO-MR result as evidence
+against Eq. 9**; at this scale it is an underpowered test, not a refutation. Resolving that gap
+honestly needs multiple seeds with paired comparisons — which is the §7 decision.
+
+What these runs CAN establish: that MT-PPO lands in the right range (~0.45, versus 0.123 before),
+that the reward-design effect reproduces on the GRPO side, and that the PPO-vs-GRPO gap
+reproduces.
+
+Note also that the paper's GRPO-OR format correctness is only **0.513** — roughly half its
+episodes never produce a valid answer. That is the expected consequence of a binary reward with
+no format term, and it means a low format score for `grpo_or` here is a reproduction, not a bug.
 
 ---
 
