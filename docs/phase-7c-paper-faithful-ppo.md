@@ -515,3 +515,104 @@ as the paper does. `--checkpoint-dir` takes any checkpoint for exactly this reas
   is fixed.
 - Phase 7b's remaining deliverables — matplotlib visuals (use the `dataviz` skill), README results
   section — are unchanged and still pending.
+
+---
+
+## 10. Gate-1 result, 2026-07-26 — phase NOT launched
+
+The five arms were **not** launched. A pre-launch reproducibility gate was run first (two
+identical short runs, `--condition ppo --train-size 32 --max-steps 5 --num-rollouts-per-step 4
+--seed 42`), with the bar "step-0 loss identical, not just close". It did not clear that bar, so
+per instruction execution stopped and handed back.
+
+### What the critic-seeding fix (`57b0894`) did fix — verified, not assumed
+
+| Check | Result |
+|---|---|
+| Critic built twice under `set_seed(42)`, compare `score.weight` | **Bit-identical** |
+| Step-0 loss spread, before the fix | 14.16 vs 9.78 — **45% apart** |
+| Step-0 loss spread, after the fix | 4.0991027 vs 4.1366970 — **0.9% apart** |
+| Step-0 episodes across the two runs | **Identical in every logged field** (question, `num_action_tokens`, `retrieval_fraction`, `format_ok`, `num_tool_turns`) |
+
+`set_seed(config.seed)` sits immediately before `build_policy_and_critic` in `build_ppo_trainer`,
+which is the correct place. Rollouts at step 0 now reproduce exactly. The dominant, seed-shaped
+term is gone.
+
+### What still differs, and why it is not a seeding bug
+
+The residual is floating-point nondeterminism. Both models run in `bfloat16`
+(`train_ppo.py:565-567`); a bf16 mantissa gives a relative epsilon around 0.4% per operation, and
+every discrepancy observed sits at that scale — `value_loss` 0.9% apart, `policy_loss` 2%, `kl`
+15% on an absolute value of 0.003. No `torch.use_deterministic_algorithms`,
+`cudnn.deterministic`, or `CUBLAS_WORKSPACE_CONFIG` is set anywhere in `src/`, and gradient
+checkpointing recomputes activations, so run-to-run variation at this magnitude is expected
+rather than anomalous.
+
+**It still costs end-to-end reproducibility.** By step 1 `retrieval_fraction` diverges (0.125 vs
+0.250): a sub-1% logit perturbation flips a sampled token and the trajectory diverges
+macroscopically from there. Same-seed runs therefore reproduce the *setup* but not the
+*trajectory* — which matters here because §2 already calls the MT-PPO-over-PPO-MR effect (+1.7 EM)
+marginal at one seed.
+
+### Open decision before this phase can launch
+
+Whether to pursue bit-identity at all. Enabling `torch.use_deterministic_algorithms(True)` plus
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` is the standard route, but it may be **unachievable** rather
+than merely slow: PyTorch raises on ops lacking a deterministic kernel, which is likely for
+attention backward under gradient checkpointing. The alternative is to accept that the seed
+controls everything a seed can control, document trajectory non-reproducibility as a known
+limitation, and launch.
+
+### State left behind
+
+- No training or eval was launched. No `p7c` systemd scopes remain.
+- The 100-step verification artifacts from §4 were moved to `outputs/_verify100/<arm>/` so fresh
+  checkpoints would not collide with their stale `checkpoint-100` directories. Nothing deleted;
+  all `train_log.jsonl` evidence preserved.
+- `scripts/check_gates.py` added — reports the four §6 gates at a glance, since
+  `analyze_train_log.py` buries them under per-episode outlier listings. Validated by reproducing
+  §4's published `mt_ppo` figures exactly (0 skips, 22.97 GB peak, format 0.78→0.80, 1.69
+  tools/ep).
+- Gate 2 (eval determinism under greedy decoding) was **not** run.
+
+---
+
+## 11. Reproducibility — resolved 2026-07-26, do not re-open
+
+Gate 1 (two same-seed runs, step-0 loss identical) **fails, and that is accepted.** Launch anyway.
+
+**What was fixed and verified.** The critic's `score.weight` is randomly initialized by
+`AutoModelForSequenceClassification.from_pretrained` and was created before `set_seed` ran, so
+`--seed` did not control it. Fixed in `57b0894` by seeding immediately before
+`build_policy_and_critic`. Verified four ways:
+
+| Check | Result |
+|---|---|
+| Critic built twice under `set_seed(42)`, compare `score.weight` | **Bit-identical** |
+| Step-0 loss spread, before the fix | 14.16 vs 9.78 — 45% apart |
+| Step-0 loss spread, after the fix | 4.0997 vs 4.1455 — ~0.9% apart |
+| Step-0 episodes across runs (questions, tokens, retrieval, format, turns) | **Identical in every field** |
+
+**What remains is bfloat16 arithmetic, not seeding.** Both models run in bf16
+(`train_ppo.py:565-567`), whose mantissa gives ~0.4% relative epsilon per operation, and every
+residual discrepancy sits at that scale. Nothing sets deterministic kernels, and gradient
+checkpointing recomputes activations, so run-to-run variation at this magnitude is expected.
+
+**Bit-identity is not achievable here — tested, not assumed.** Enabling
+`torch.use_deterministic_algorithms(True)` with `CUBLAS_WORKSPACE_CONFIG=:4096:8` fails on this
+stack before even reaching attention backward:
+
+```
+ValueError: Pointer argument cannot be accessed from Triton (cpu tensor?)
+```
+
+**And it would not help the thing we care about anyway.** A sub-1% logit perturbation flips a
+sampled token, so trajectories diverge by step 1 — bf16 noise acts as a second, uncontrolled seed.
+Bit-determinism would let a run be replayed exactly (useful for auditing) but would **not reduce
+the variance of the estimate**. The +1.7 EM point MT-PPO-over-PPO-MR effect is marginal at one
+seed, and the only real remedy for that is multiple seeds with paired comparisons — which is the
+§7 decision, not a determinism problem.
+
+**So the standard for this phase is: the seed controls initialization and data order, and
+trajectories are not reproducible.** State that plainly in the write-up alongside the other
+deviations. Do not spend further time chasing bit-identity.
