@@ -1,23 +1,20 @@
 # Phase 8: LLM-as-Judge Reward (Bedrock + gpt-oss)
 
-> **Scope clarified 2026-07-26.** This phase reproduces the paper's judge; the interesting
-> comparison moved to Phase 8b.
+> **Scope clarified 2026-07-26.**
 >
-> **Know what is and is not reproducible here.** Confirmed by direct fetch: the paper never
-> benchmarks its judge. Table 2 is entirely deterministic rewards, and the judge appears only as
-> training reward curves (Figure 6) on **NQ**, a dataset this repo does not use. So there is **no
-> target EM number to hit**. What this phase can legitimately reproduce is the paper's reported
-> *training-curve stability* under judge rewards — on our HotpotQA pipeline, which is itself a
-> deviation worth stating.
+> **This phase runs a full MT-PPO training + evaluation with the LLM judge as the reward**, exactly
+> like every other arm: same pipeline, same held-out set, same seed. It produces real EM and format
+> numbers that sit directly alongside Phase 7c's five arms.
 >
-> Build it, smoke-test it, and confirm judge rewards produce stable optimization. Do not claim a
-> benchmark reproduction; there is nothing to reproduce against.
+> **One thing only is unavailable: a paper number to check the judge against.** Confirmed by direct
+> fetch — the paper's Table 2 is entirely deterministic rewards, and the judge appears only as
+> training reward curves (Figure 6) on NQ, with no benchmark result reported. So we can compare the
+> judge arm to *our* arms and to the paper's deterministic MT-PPO anchor (EM 0.453 / format 0.998),
+> but there is no published judge score to reproduce. That is a limitation on external validation,
+> not on the experiment.
 >
-> **The scientifically interesting question is Phase 8b** (`docs/phase-8b-full-judge-runs.md`):
-> the paper motivates the judge by exact match being "overly rigid", which is the same limitation
-> this repo's F1+EM deviation independently addressed. 8b compares those two treatments. Build
-> this phase with that comparison in mind — in particular, keep the judge reward swappable at the
-> same seam as the deterministic outcome reward, so 8b can run all three arms without rework.
+> **Keep the judge reward swappable at the same seam as the deterministic outcome reward**, so
+> Phase 8b can run all three arms (binary EM / judge / F1 partial credit) without rework.
 
 ## Goal
 
