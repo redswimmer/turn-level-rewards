@@ -102,6 +102,31 @@ R^O (final turn):
 `retrieval_fraction` only ever grows, so "ground truth in results" for *this* turn means the
 fraction rose during it.
 
+### On the step count — 500 steps, and why it may not be enough
+
+The paper trains for **500 steps** ("Training is performed for 500 steps over 4 epochs") at a
+total batch size of 512. We match the step count but not the batch:
+
+```
+paper:  500 steps x 512 batch = 256,000 episodes
+ours:   500 steps x   4 batch =   2,000 episodes    (128x less data)
+```
+
+Matching data volume would require ~64,000 steps (~250 hours) and is not viable, so 500 matches
+their **update count**, not their data. **Run 500 first** — it is the paper's number and a real
+anchor, and deviating on step count as well as batch size compounds deviations.
+
+**But expect it may be undertrained, and check rather than assume.** At 100 steps `ppo_mr`'s
+format compliance was still climbing (0.61 → 0.83), and Phase 6 hit exactly this on the GRPO
+track: 300 steps were inconclusive and 600 resolved it. Apply Phase 6's "is more training
+needed?" checklist at 500 — if the curves have not plateaued, extend and say so in the write-up.
+Doubling to 1,000 steps costs roughly 21 h across all five arms (500 steps is ~10.5 h total:
+PPO 1.7 / 3.5 / 3.0 h, GRPO ~1.6 / 0.7 h).
+
+Note that more steps at a tiny batch is NOT equivalent to fewer steps at a large one — the
+gradients stay noisy, so it buys more updates of lower quality, with more exposure to the PPO
+instability the paper itself documents. Extend because a measurement says to, not by default.
+
 ### Anchor targets — the paper's Table 2, HotpotQA
 
 | Arm | EM | Format correctness |
@@ -196,15 +221,45 @@ s/row under contention. Use 3 shards; more will not help.
 ```bash
 for S in 0 1 2; do
   .venv/bin/python -m turn_level_rewards.evaluate_ppo \
-    --condition $C --checkpoint-dir outputs/$C/checkpoint-500 --eval-size 2000 \
+    --condition $C --checkpoint-dir outputs/$C/checkpoint-500 --eval-size 7405 \
     --num-shards 3 --shard $S --output results/$C-shard$S.json &
 done; wait
 .venv/bin/python scripts/merge_eval_shards.py results/$C-shard*.json --output results/$C-eval.json
 ```
 
-**Eval size**: 2,000 rows is recommended over the full 7,405. At n=2,000 the standard error on EM
-is ~1 point, far below any gap that matters, and it turns a ~29 h `mt_ppo` eval into ~8 h. Phase
-7b's full-set eval of `mt_ppo` took **29.1 hours** — budget accordingly if you use the full set.
+GRPO arms use the other evaluator (`evaluate.py`, which routes through `GRPOTrainer.evaluate()`
+and batches, so no sharding is needed):
+
+```bash
+for C in grpo_or grpo_mr; do
+  .venv/bin/python -m turn_level_rewards.evaluate \
+    --condition $C --checkpoint-dir outputs/$C/checkpoint-500 --eval-size 7405 \
+    --output results/$C-eval.json
+done
+```
+
+Confirm `evaluate.py`'s exact CLI before running — it was written in Phase 6 for the
+`outcome_only`/`turn_level` conditions and may need the new condition names threading through.
+This is the one part of the pipeline **not** smoke-tested for the paper-faithful GRPO conditions,
+because those checkpoints did not exist at handoff time. Check it on a tiny `--eval-size` first.
+
+**Eval size: use the FULL 7,405-row held-out set.** Not a subset. This matches Phase 7b and
+Phases 5-6, and the eval set is the one place where using less data buys nothing scientifically —
+it only adds a caveat to the write-up.
+
+Budget honestly, but do not pre-emptively shrink it:
+
+- **GRPO arms are cheap.** `evaluate.py` goes through `GRPOTrainer.evaluate()`, which batches.
+- **PPO arms are the slow ones.** `evaluate_ppo.py` drives `_rollout_episode` one episode at a
+  time. Phase 7b measured `mt_ppo`'s full-set eval at **29.1 hours** — but that number is stale
+  and almost certainly much too pessimistic now: it predates the answer-turn fix and the λs search
+  penalty, which cut searches per episode to ~1.7 from a full 4-turn burn. Eval time scales with
+  generated tokens.
+- **Shard the PPO evals 3 ways** (~1.6x measured on this box).
+
+If an eval genuinely proves too slow, shard harder or raise it with the user — do **not** silently
+substitute a subset. Partial metrics are written as the run proceeds (marked
+`{"complete": false}`), so progress is visible and a kill costs only the remaining rows.
 
 Eval prints progress every 50 rows and writes partial metrics marked `{"complete": false}`.
 `merge_eval_shards.py` refuses to merge incomplete shards.
