@@ -1478,6 +1478,10 @@ class MTPPOTrainer(Trainer):
                     f"the questions attempted",
                     flush=True,
                 )
+                # Skips must reach trackio too, or the dashboard silently under-reports how much
+                # of a run actually happened -- and an asymmetric skip rate between arms is the
+                # confound that invalidated Phase 7b (mt_ppo took 431 real updates to ppo's 499).
+                trackio.log({"step": step, "skipped": 1.0, **gpu_stats})
                 self.state.global_step = step + 1
                 continue
             gpu_stats = {
@@ -1504,6 +1508,28 @@ class MTPPOTrainer(Trainer):
                 "clip_fraction": update_metrics["clip_fraction"],
                 "reward": mean_reward,
                 "retrieval_fraction": mean_retrieval_fraction,
+                # The four metrics this phase is actually judged on. All were previously
+                # computed (or logged to train_log.jsonl) but never reached trackio, so the
+                # dashboard could not answer the questions that matter most:
+                #   format_compliance -- the anchor. The paper reports 0.998 on HotpotQA; this
+                #     repo's pre-fix runs sat near 0.48. It was already being computed for
+                #     CollapseMonitor and then discarded.
+                #   ended_on_tool_rate -- must stay 0.0. Nonzero means the answer-turn defect
+                #     has regressed and episodes are being penalised for a turn they never got.
+                #   mean_tool_turns -- the search penalty's observable effect; uncontrolled
+                #     growth here is what preceded the earlier OOM cascade.
+                #   skipped -- 0.0/1.0 per step, so the dashboard shows the skip RATE. Skips
+                #     differing between arms is the confound that invalidated Phase 7b.
+                "format_compliance": sum(e["format_reward"] for e in episodes) / len(episodes),
+                "ended_on_tool_rate": sum(
+                    1.0
+                    for e in episodes
+                    if e["completion"] and e["completion"][-1].get("role") == "tool"
+                )
+                / len(episodes),
+                "mean_tool_turns": sum(len(e["turn_boundary_action_indices"]) for e in episodes)
+                / len(episodes),
+                "skipped": 0.0,
                 **gpu_stats,
             }
             trackio.log(metrics)
@@ -1549,6 +1575,11 @@ class MTPPOTrainer(Trainer):
                     # role:tool message with no generation left in which to answer, and was then
                     # penalised for not answering. ended_on_tool must now be False for every
                     # episode; a nonzero rate means that regression is back.
+                    # The format-compliance anchor (paper: 0.998 on HotpotQA), logged
+                    # explicitly because it is NOT derivable from format_and_outcome_reward
+                    # for the ppo arm: PPO-OR's reward is binary correctness with no format
+                    # term, so 0.0 means "wrong answer" OR "no answer" indistinguishably.
+                    "format_ok": episode["format_reward"],
                     "num_tool_turns": len(episode["turn_boundary_action_indices"]),
                     "ended_on_tool": episode["completion"][-1].get("role") == "tool"
                     if episode["completion"]
