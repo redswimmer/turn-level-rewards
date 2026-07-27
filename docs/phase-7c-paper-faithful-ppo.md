@@ -245,13 +245,18 @@ done; wait
 .venv/bin/python scripts/merge_eval_shards.py results/$C-shard*.json --output results/$C-eval.json
 ```
 
+**`--eval-batch-size 4` is required, not optional.** The flag defaults to 2, which still runs
+and still produces correct numbers -- it just takes ~24 h for the two GRPO arms instead of
+~6.5 h. It fails silently in the worst way: by being slow, not by erroring.
+
 GRPO arms use the other evaluator (`evaluate.py`, which routes through `GRPOTrainer.evaluate()`
 and batches, so no sharding is needed):
 
 ```bash
 for C in grpo_or grpo_mr; do
   .venv/bin/python -m turn_level_rewards.evaluate \
-    --condition $C --checkpoint outputs/$C/checkpoint-500 --eval-size 7404 \
+    --condition $C --checkpoint outputs/$C/checkpoint-500 \
+    --eval-size 7404 --eval-batch-size 4 \
     --output results/$C-eval.json
 done
 ```
