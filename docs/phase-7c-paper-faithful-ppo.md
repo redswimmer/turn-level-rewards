@@ -5,6 +5,21 @@
 **Status**: implementation complete, smoke-tested, verified to 100 steps. **Ready to launch the
 five full runs.** Nothing is half-finished; everything described here is committed.
 
+## STOP CONDITIONS — read before doing anything
+
+1. **Do not change the experiment.** Step count (500), eval size (full 7,405), batch
+   (`num_rollouts_per_step=4`, `num_generations=8`), seed (42) and the reward design are all
+   decided, with the reasoning recorded below. If you believe one is wrong, say so and stop —
+   do not adjust it.
+2. **Stop after one run of each arm plus evaluation, and report.** Do not start additional
+   seeds, do not extend training, do not begin Phase 8. §7 covers what to report.
+3. **Stop if a gate in §6 trips** (skip rate climbing or diverging between arms,
+   `ended_on_tool` above 0, format compliance flat near 0.5 by step 150, or a `DEAD RUN`
+   banner). Report rather than working around it.
+4. **Stop if something is genuinely broken.** Everything here was verified live at 100 steps
+   per arm, and both eval paths were smoke-tested end to end. If reality contradicts this
+   document, that is worth surfacing, not silently repairing.
+
 **Read this document first and in full.** It is self-contained: you do not need to read the
 Phase 7b history to execute it. Read `CLAUDE.md` for repo-wide context (model, dataset,
 retrieval server, guiding principles) and then come back here.
