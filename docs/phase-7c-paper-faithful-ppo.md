@@ -2,10 +2,19 @@
 
 **PPO-OR · PPO-MR · MT-PPO · GRPO-OR · GRPO-MR — all under the paper's own reward design.**
 
-**Status**: implementation complete, smoke-tested, verified to 100 steps. **Ready to launch the
-five full runs.** Nothing is half-finished; everything described here is committed.
+**Status**: `ppo` (PPO-OR) is COMPLETE — it collapsed, and that is its result (see §12).
+**Four arms remain to train**: `ppo_mr`, `mt_ppo`, `grpo_or`, `grpo_mr`. Everything is
+implemented, committed, and verified to 100 steps per arm.
 
 ## STOP CONDITIONS — read before doing anything
+
+0. **`ppo` (PPO-OR) is ALREADY DONE. Do not train it. Train four arms, not five:**
+   `ppo_mr`, `mt_ppo`, `grpo_or`, `grpo_mr`. The `ppo` arm was run on 2026-07-27, collapsed,
+   and **that collapse is its result** — re-running it produces a longer collapse, nothing
+   more. Its checkpoints are preserved and get evaluated like any other arm.
+   **Read §12 before anything else**; it has the full analysis and tells you which checkpoints
+   to evaluate. Sections 2-4 below describe five arms because that is the experiment's design —
+   one of the five is simply already complete.
 
 1. **Do not change the experiment.** Step count (500), eval size (7,404 — see §3), batch
    (`num_rollouts_per_step=4`, `num_generations=8`), seed (42) and the reward design are all
