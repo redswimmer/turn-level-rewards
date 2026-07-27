@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+import bitsandbytes as bnb
 import torch
 import torch.nn as nn
 import trackio
@@ -37,9 +38,15 @@ from transformers.trainer_utils import get_last_checkpoint, rotate_checkpoints, 
 from trl.chat_template_utils import add_response_schema, get_training_chat_template, parse_response
 
 from turn_level_rewards.env import SearchEnv
-from turn_level_rewards.rewards import TURN_REWARD_SCALE, format_reward, outcome_reward
+from turn_level_rewards.rewards import (
+    TURN_REWARD_SCALE,
+    _extract_answer,
+    paper_binary_outcome_reward,
+    paper_outcome_reward,
+    paper_turn_reward,
+)
 
-Condition = Literal["ppo", "mt_ppo"]
+Condition = Literal["ppo", "ppo_mr", "mt_ppo"]
 
 MODEL_NAME = "Qwen/Qwen3.5-0.8B"
 
@@ -279,6 +286,7 @@ class MTPPOConfig(TrainingArguments):
     gae_lambda: float = 1.0
     num_ppo_epochs: int = 4
     value_loss_coef: float = 0.5
+    use_8bit_optimizer: bool = True
     num_rollouts_per_step: int = 2
     save_steps: int = 50
     save_total_limit: int = 3
@@ -293,6 +301,7 @@ def build_ppo_config(
     num_rollouts_per_step: int,
     save_steps: int = 50,
     save_total_limit: int = 3,
+    use_8bit_optimizer: bool = True,
 ) -> MTPPOConfig:
     """Build the MTPPOConfig for a training run. Mirrors train.py's build_config role from
     Phase 4 -- fixed hyperparameters are baked in here, not exposed as independent CLI flags.
@@ -311,6 +320,7 @@ def build_ppo_config(
         gae_lambda=1.0,
         num_ppo_epochs=4,
         value_loss_coef=0.5,
+        use_8bit_optimizer=use_8bit_optimizer,
         num_rollouts_per_step=num_rollouts_per_step,
         save_steps=save_steps,
         save_total_limit=save_total_limit,
@@ -350,6 +360,58 @@ def compute_gae(
         advantages[t] = running_gae
         next_value = values[t]
     return advantages
+
+
+def place_paper_rewards(
+    num_tokens: int,
+    turn_boundary_token_indices: list[int],
+    turn_rewards: list[float],
+    outcome_reward_value: float,
+    condition: Condition,
+) -> list[float]:
+    """Place the paper's R^I / R^O onto the action-token sequence, per condition.
+
+    The three arms differ ONLY in where reward lands -- the components are computed by the
+    caller (rewards.paper_turn_reward / paper_outcome_reward / paper_binary_outcome_reward), so
+    this function is the whole of the OR/MR/MT distinction and nothing else:
+
+      ppo     (PPO-OR) : R^O alone, on the last token. Section 6.1: "vanilla PPO trained with
+                         only outcome rewards, where the trajectory-level reward is a binary
+                         signal indicating final-answer correctness." No R^I at all.
+      ppo_mr  (PPO-MR) : R^O + sum(R^I), ALL on the last token. Section 6.1 calls this a
+                         "trajectory-level reward [that] combines intermediate rewards
+                         (retrieval correctness) and outcome rewards" -- same information as
+                         MT-PPO, collapsed into one terminal scalar.
+      mt_ppo  (MT-PPO) : R^I at each intermediate turn boundary, R^O on the last token. This is
+                         Eq. 9, and the paper's actual contribution.
+
+    PPO-MR is the control that makes the ablation interpretable. ppo -> ppo_mr isolates the
+    value of the extra reward signal; ppo_mr -> mt_ppo isolates the value of turn-level
+    placement. Comparing only ppo to mt_ppo (as this repo did before) changes both at once, so
+    any measured advantage could not be attributed to Eq. 9.
+
+    turn_boundary_token_indices index the compressed ACTION-token sequence (policy-generated
+    tokens only) -- see _rollout_episode's docstring.
+    """
+    if len(turn_boundary_token_indices) != len(turn_rewards):
+        raise ValueError(
+            f"turn_boundary_token_indices ({len(turn_boundary_token_indices)}) and turn_rewards "
+            f"({len(turn_rewards)}) must be equal length"
+        )
+    if num_tokens < 1:
+        raise ValueError(f"num_tokens must be >= 1, got {num_tokens}")
+
+    per_token_rewards = [0.0] * num_tokens
+    per_token_rewards[-1] += outcome_reward_value
+
+    if condition == "ppo_mr":
+        per_token_rewards[-1] += sum(turn_rewards)
+    elif condition == "mt_ppo":
+        for token_index, turn_reward_value in zip(
+            turn_boundary_token_indices, turn_rewards, strict=True
+        ):
+            per_token_rewards[token_index] += turn_reward_value
+    return per_token_rewards
 
 
 def place_turn_rewards(
@@ -589,7 +651,21 @@ class MTPPOTrainer(Trainer):
         # are all real attributes defined on this file's _PolicyAndCritic and MTPPOConfig
         # classes respectively. They are safe; ty's inability to see through Trainer's looser
         # base types is not a real issue here.
-        self.optimizer = torch.optim.AdamW(
+        # 8-bit optimizer states, for memory not for speed. AdamW keeps two fp32 states per
+        # parameter across BOTH the policy and the critic, measured at ~6.4 GB of this setup's
+        # ~10 GB static floor on a 24 GB card; 8-bit quantization takes that to ~3.2 GB.
+        #
+        # This is load-bearing for experimental validity, not just throughput. Without it,
+        # mt_ppo skips OOM steps that ppo/ppo_mr do not (its turn reward produces longer
+        # episodes), so the arms of the comparison silently receive different numbers of real
+        # gradient updates -- the exact confound that invalidated the 2026-07-25 runs, where
+        # mt_ppo got 431 updates against ppo's 499. Measured: 13.8% skips before the log-prob
+        # chunking fix, 2.8% after it, 0% with this as well.
+        #
+        # AdamW8bit is a drop-in for torch.optim.AdamW (same update rule, quantized state), so
+        # it changes memory rather than optimization semantics.
+        optimizer_class = bnb.optim.AdamW8bit if self.args.use_8bit_optimizer else torch.optim.AdamW  # ty: ignore[unresolved-attribute]
+        self.optimizer = optimizer_class(
             [
                 {"params": self.model.policy.parameters(), "lr": self.args.policy_lr},  # ty: ignore[unresolved-attribute]
                 {"params": self.model.critic.parameters(), "lr": self.args.critic_lr},  # ty: ignore[unresolved-attribute]
@@ -636,6 +712,12 @@ class MTPPOTrainer(Trainer):
         action_mask: list[int] = []
         turn_boundary_action_indices: list[int] = []
         retrieval_fraction_after_each_turn: list[float] = []
+        # Per-turn inputs to the paper's R^I (rewards.paper_turn_reward): whether this
+        # turn's tool calls were well-formed, and how many searches have been issued in
+        # total up to and including this turn (the paper's n_search is cumulative).
+        turn_format_ok: list[bool] = []
+        cumulative_searches_after_each_turn: list[int] = []
+        searches_so_far = 0
         num_action_tokens = 0
 
         # n_max + 1 generations for n_max tool rounds, so the policy ALWAYS gets one final turn
@@ -717,6 +799,7 @@ class MTPPOTrainer(Trainer):
                 # TRL, whose loop likewise leaves the final turn's calls unexecuted.
                 break
 
+            turn_had_bad_call = False
             for tool_call in tool_calls:
                 # A real failure Task 13's live smoke test caught: an untrained (or
                 # early-training) policy can hallucinate a tool call that doesn't match
@@ -763,6 +846,7 @@ class MTPPOTrainer(Trainer):
                 # why the type half is not optional.
                 argument_error = validate_tool_call_arguments(environment.search, call_args)
                 if argument_error is not None:
+                    turn_had_bad_call = True
                     messages.append(
                         {
                             "role": "tool",
@@ -781,8 +865,11 @@ class MTPPOTrainer(Trainer):
                 result = environment.search(**call_args)
                 messages.append({"role": "tool", "name": "search", "content": result})
 
+            searches_so_far += len(tool_calls)
             turn_boundary_action_indices.append(num_action_tokens - 1)
             retrieval_fraction_after_each_turn.append(environment.retrieval_fraction)
+            turn_format_ok.append(not turn_had_bad_call)
+            cumulative_searches_after_each_turn.append(searches_so_far)
 
         completion = messages[len(row["prompt"]) :]
         return {
@@ -791,6 +878,8 @@ class MTPPOTrainer(Trainer):
             "full_token_ids": full_token_ids,
             "action_mask": action_mask,
             "turn_boundary_action_indices": turn_boundary_action_indices,
+            "turn_format_ok": turn_format_ok,
+            "cumulative_searches_after_each_turn": cumulative_searches_after_each_turn,
             "retrieval_fraction_after_each_turn": retrieval_fraction_after_each_turn,
         }
 
@@ -925,17 +1014,46 @@ class MTPPOTrainer(Trainer):
                 )
 
             completion = rollout["completion"]
-            format_r = format_reward([completion])[0]
-            outcome_r = outcome_reward([completion], [row["golden_answers"]])[0]
-            format_and_outcome_reward = format_r + outcome_r
+            # Paper-faithful rewards (arXiv:2505.11821v2 Sections 5.2/6.1), NOT the GRPO track's
+            # format/F1+EM rewards. Section 6.1 defines PPO-OR's reward as "a binary signal
+            # indicating final-answer correctness" with no format term at all; PPO-MR and MT-PPO
+            # use the graded R^O (+1.0 correct / +0.2 wrong-but-formatted / -1.0 bad format)
+            # plus per-turn R^I. See rewards.py's paper_* functions for why carrying the GRPO
+            # rewards into this track made the earlier Phase 7b runs a non-reproduction.
+            if self.condition == "ppo":
+                outcome_r = paper_binary_outcome_reward(completion, row["golden_answers"])
+            else:
+                outcome_r = paper_outcome_reward(completion, row["golden_answers"])
 
+            # R^I per intermediate turn. found_gold is the MARGINAL retrieval gain, not the
+            # cumulative value: SearchEnv.retrieval_fraction only ever grows, so "ground truth in
+            # results" for THIS turn means the fraction rose during it.
+            previous_fraction = 0.0
+            turn_rewards = []
+            for fraction, format_ok, n_search in zip(
+                rollout["retrieval_fraction_after_each_turn"],
+                rollout["turn_format_ok"],
+                rollout["cumulative_searches_after_each_turn"],
+                strict=True,
+            ):
+                turn_rewards.append(
+                    paper_turn_reward(
+                        found_gold=fraction > previous_fraction,
+                        format_ok=format_ok,
+                        cumulative_searches=n_search,
+                    )
+                )
+                previous_fraction = fraction
+
+            format_r = 1.0 if _extract_answer(completion) is not None else 0.0
+            format_and_outcome_reward = outcome_r
             retrieval_fraction = _final_retrieval_fraction(rollout)
 
-            per_token_rewards = place_turn_rewards(
+            per_token_rewards = place_paper_rewards(
                 num_tokens=len(old_values),
                 turn_boundary_token_indices=rollout["turn_boundary_action_indices"],
-                retrieval_fraction_after_each_turn=rollout["retrieval_fraction_after_each_turn"],
-                format_and_outcome_reward=format_and_outcome_reward,
+                turn_rewards=turn_rewards,
+                outcome_reward_value=outcome_r,
                 condition=self.condition,
             )
             advantages = compute_gae(
@@ -1477,7 +1595,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train multi-turn PPO/MT-PPO (see CLAUDE.md and docs/phase-7-mt-ppo.md)."
     )
-    parser.add_argument("--condition", required=True, choices=["ppo", "mt_ppo"])
+    parser.add_argument("--condition", required=True, choices=["ppo", "ppo_mr", "mt_ppo"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-size", type=int, default=8)
     parser.add_argument("--max-steps", type=int, default=2)

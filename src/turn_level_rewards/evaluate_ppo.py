@@ -34,7 +34,7 @@ from turn_level_rewards.train_ppo import (
     build_ppo_config,
 )
 
-Condition = Literal["ppo", "mt_ppo"]
+Condition = Literal["ppo", "ppo_mr", "mt_ppo"]
 
 
 class RolloutSource(Protocol):
@@ -221,7 +221,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate a saved MTPPOTrainer checkpoint on the held-out set (see CLAUDE.md)."
     )
-    parser.add_argument("--condition", required=True, choices=["ppo", "mt_ppo"])
+    parser.add_argument("--condition", required=True, choices=["ppo", "ppo_mr", "mt_ppo"])
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval-size", type=int, default=4)

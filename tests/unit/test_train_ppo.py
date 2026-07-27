@@ -22,6 +22,7 @@ from turn_level_rewards.train_ppo import (
     compute_ppo_loss,
     gather_action_logprobs,
     normalize_advantages,
+    place_paper_rewards,
     place_turn_rewards,
     resolve_auto_checkpoint,
     resolve_stop_token_ids,
@@ -824,3 +825,127 @@ def test_compute_ppo_loss_kl_penalty_increases_the_loss():
     )
 
     assert diverged["loss"].item() > matched["loss"].item()
+
+
+def test_place_paper_rewards_ppo_or_places_outcome_only():
+    """PPO-OR: Section 6.1, "trained with ONLY outcome rewards". No R^I anywhere."""
+    rewards = place_paper_rewards(
+        num_tokens=6,
+        turn_boundary_token_indices=[1, 3],
+        turn_rewards=[0.3, -0.1],
+        outcome_reward_value=1.0,
+        condition="ppo",
+    )
+
+    assert rewards == [0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+
+
+def test_place_paper_rewards_ppo_mr_sums_everything_onto_the_last_token():
+    """PPO-MR: same information as MT-PPO, collapsed into one trajectory-level scalar.
+
+    This is the control that makes the ablation interpretable -- ppo -> ppo_mr isolates the
+    added reward signal, ppo_mr -> mt_ppo isolates Eq. 9's turn-level placement. Comparing only
+    ppo to mt_ppo changes both at once.
+    """
+    rewards = place_paper_rewards(
+        num_tokens=6,
+        turn_boundary_token_indices=[1, 3],
+        turn_rewards=[0.3, -0.1],
+        outcome_reward_value=1.0,
+        condition="ppo_mr",
+    )
+
+    assert rewards == [0.0, 0.0, 0.0, 0.0, 0.0, pytest.approx(1.2)]
+    assert rewards[1] == 0.0 and rewards[3] == 0.0
+
+
+def test_place_paper_rewards_mt_ppo_places_each_turn_reward_at_its_boundary():
+    """MT-PPO: Eq. 9 -- R^I at each intermediate turn ending, R^O at the trajectory's end."""
+    rewards = place_paper_rewards(
+        num_tokens=6,
+        turn_boundary_token_indices=[1, 3],
+        turn_rewards=[0.3, -0.1],
+        outcome_reward_value=1.0,
+        condition="mt_ppo",
+    )
+
+    assert rewards[1] == pytest.approx(0.3)
+    assert rewards[3] == pytest.approx(-0.1)
+    assert rewards[-1] == pytest.approx(1.0)
+    assert rewards[0] == rewards[2] == rewards[4] == 0.0
+
+
+def test_place_paper_rewards_mr_and_mt_carry_identical_total_reward():
+    """The two arms must differ ONLY in placement -- if their totals differed, the comparison
+    would be confounded by reward magnitude rather than isolating Eq. 9.
+    """
+    kwargs = {
+        "num_tokens": 8,
+        "turn_boundary_token_indices": [2, 5],
+        "turn_rewards": [0.3, -0.15],
+        "outcome_reward_value": 0.2,
+    }
+
+    mr = place_paper_rewards(condition="ppo_mr", **kwargs)
+    mt = place_paper_rewards(condition="mt_ppo", **kwargs)
+
+    assert sum(mr) == pytest.approx(sum(mt))
+
+
+def test_place_paper_rewards_with_no_intermediate_turns_is_identical_across_conditions():
+    """An episode that answers immediately has no R^I to place, so all three arms must agree --
+    otherwise the conditions would differ on episodes where the treatment cannot apply.
+    """
+    kwargs = {
+        "num_tokens": 3,
+        "turn_boundary_token_indices": [],
+        "turn_rewards": [],
+        "outcome_reward_value": -1.0,
+    }
+
+    assert (
+        place_paper_rewards(condition="ppo", **kwargs)
+        == place_paper_rewards(condition="ppo_mr", **kwargs)
+        == place_paper_rewards(condition="mt_ppo", **kwargs)
+        == [0.0, 0.0, -1.0]
+    )
+
+
+def test_place_paper_rewards_rejects_mismatched_turn_inputs():
+    with pytest.raises(ValueError, match="equal length"):
+        place_paper_rewards(
+            num_tokens=4,
+            turn_boundary_token_indices=[1, 2],
+            turn_rewards=[0.3],
+            outcome_reward_value=1.0,
+            condition="mt_ppo",
+        )
+
+
+def test_paper_turn_reward_search_penalty_grows_with_cumulative_searches():
+    """lambda_s penalises the CUMULATIVE search count, so later turns are penalised harder --
+    the term the paper says prevents "uncontrolled search usage" when omitted.
+    """
+    from turn_level_rewards.rewards import paper_turn_reward
+
+    first = paper_turn_reward(found_gold=True, format_ok=True, cumulative_searches=1)
+    fourth = paper_turn_reward(found_gold=True, format_ok=True, cumulative_searches=4)
+
+    assert first == pytest.approx(0.3 + 0.1 - 0.1)
+    assert fourth == pytest.approx(0.3 + 0.1 - 0.4)
+    assert fourth < first
+
+
+def test_paper_outcome_reward_scale_matches_the_paper():
+    from turn_level_rewards.rewards import paper_binary_outcome_reward, paper_outcome_reward
+
+    answered = [{"role": "assistant", "content": "<answer>Paris</answer>"}]
+    unanswered = [{"role": "tool", "name": "search", "content": "docs"}]
+
+    assert paper_outcome_reward(answered, ["Paris"]) == 1.0
+    assert paper_outcome_reward(answered, ["Berlin"]) == 0.2
+    assert paper_outcome_reward(unanswered, ["Paris"]) == -1.0
+    # PPO-OR carries no format term at all: not answering and answering wrongly both score 0.0.
+    assert paper_binary_outcome_reward(answered, ["Paris"]) == 1.0
+    assert paper_binary_outcome_reward(answered, ["Berlin"]) == 0.0
+    assert paper_binary_outcome_reward(unanswered, ["Paris"]) == 0.0
