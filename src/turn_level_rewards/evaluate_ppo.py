@@ -46,7 +46,7 @@ class RolloutSource(Protocol):
     Guiding principles, dependency inversion at the slow/external boundary).
     """
 
-    def _rollout_episode(self, row: dict) -> dict: ...
+    def _rollout_episode(self, row: dict, greedy: bool = False) -> dict: ...
 
 
 # Rows between progress lines. 50 keeps the log readable over a 7,405-row run while still
@@ -189,7 +189,9 @@ def run_eval(
     started = time.monotonic()
     with torch.no_grad():
         for index, row in enumerate(rows, start=1):
-            rollout = trainer._rollout_episode(row)
+            # greedy: evaluation must be deterministic, so the same checkpoint scores the
+            # same number every run. See _rollout_episode's greedy parameter.
+            rollout = trainer._rollout_episode(row, greedy=True)
             completions.append(rollout["completion"])
             golden_answers_list.append(row["golden_answers"])
             retrieval_fractions.append(_final_retrieval_fraction(rollout))

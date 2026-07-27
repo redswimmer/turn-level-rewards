@@ -54,7 +54,10 @@ class _FakeTrainer:
     def __init__(self):
         self.calls = 0
 
-    def _rollout_episode(self, row):
+    def _rollout_episode(self, row, greedy=False):
+        # greedy is asserted, not merely accepted: evaluation must be deterministic, and a fake
+        # that silently swallowed the flag would let a regression to sampled eval pass unnoticed.
+        assert greedy is True, "run_eval must evaluate greedily"
         self.calls += 1
         return {
             "completion": [
@@ -90,10 +93,10 @@ def test_run_eval_marks_partial_writes_incomplete_until_the_last_row(tmp_path):
     seen = []
 
     class _Watching(_FakeTrainer):
-        def _rollout_episode(self, row):
+        def _rollout_episode(self, row, greedy=False):
             if partial.exists():
                 seen.append(json.loads(partial.read_text())["complete"])
-            return super()._rollout_episode(row)
+            return super()._rollout_episode(row, greedy=greedy)
 
     run_eval(_Watching(), _rows(6), report_every=2, partial_path=partial)
 

@@ -676,7 +676,7 @@ class MTPPOTrainer(Trainer):
         self.lr_scheduler = get_constant_schedule(self.optimizer)
         return self.optimizer
 
-    def _rollout_episode(self, row: dict) -> dict:
+    def _rollout_episode(self, row: dict, greedy: bool = False) -> dict:
         """Run one multi-turn episode for a single dataset row: real generation, real tool calls
         against the real retrieval server (via self.environment_factory, e.g. SearchEnv).
 
@@ -773,8 +773,19 @@ class MTPPOTrainer(Trainer):
                 generation = policy.generate(  # ty: ignore[call-non-callable, unresolved-attribute]
                     input_ids,
                     max_new_tokens=self.args.max_completion_length,  # ty: ignore[unresolved-attribute]
-                    do_sample=True,
-                    temperature=1.0,
+                    # greedy=True is for EVALUATION. Training must sample -- exploration is where
+                    # the policy gradient comes from -- but scoring a fixed checkpoint with
+                    # temperature-1.0 sampling makes the benchmark itself random: the same
+                    # checkpoint on the same held-out set returns a different EM every run.
+                    #
+                    # That is not a cosmetic reproducibility issue here. The paper's MT-PPO
+                    # advantage over PPO-MR is +1.7 EM points, and this phase already has to
+                    # worry about whether one seed can resolve it. Adding a second, independent
+                    # source of noise on top of seed variance could easily be the difference
+                    # between seeing that effect and not. Standard benchmark practice is greedy
+                    # decoding, and the paper reports single point estimates, implying the same.
+                    do_sample=not greedy,
+                    **({} if greedy else {"temperature": 1.0}),
                     # Without this, generate() falls back to the policy's own
                     # generation_config.eos_token_id (<|endoftext|>, a DOCUMENT terminator) and
                     # sails straight past each turn's <|im_end|>. See resolve_stop_token_ids.

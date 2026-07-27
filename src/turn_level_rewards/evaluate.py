@@ -45,6 +45,14 @@ def build_eval_config(condition: Condition, eval_batch_size: int) -> GRPOConfig:
         max_tool_calling_iterations=4,
         beta=0.0,
         max_completion_length=2048,
+        # Greedy decoding, matching evaluate_ppo.py. Training must sample -- GRPO in
+        # particular NEEDS sampling, since its advantage comes from variance between
+        # rollouts of the same prompt -- but scoring a fixed checkpoint with temperature-1.0
+        # sampling makes the benchmark itself random: the same checkpoint on the same
+        # held-out set returns a different EM every run. The paper reports single point
+        # estimates, implying deterministic decoding, and this phase is trying to resolve a
+        # +1.7 EM point effect that a second noise source could easily hide.
+        top_k=1,
         report_to="none",
     )
 
