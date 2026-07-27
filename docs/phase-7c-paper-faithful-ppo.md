@@ -239,7 +239,7 @@ s/row under contention. Use 3 shards; more will not help.
 ```bash
 for S in 0 1 2; do
   .venv/bin/python -m turn_level_rewards.evaluate_ppo \
-    --condition $C --checkpoint-dir outputs/$C/checkpoint-500 --eval-size 7405 \
+    --condition $C --checkpoint-dir outputs/$C/checkpoint-500 --eval-size 7404 \
     --num-shards 3 --shard $S --output results/$C-shard$S.json &
 done; wait
 .venv/bin/python scripts/merge_eval_shards.py results/$C-shard*.json --output results/$C-eval.json
@@ -251,7 +251,7 @@ and batches, so no sharding is needed):
 ```bash
 for C in grpo_or grpo_mr; do
   .venv/bin/python -m turn_level_rewards.evaluate \
-    --condition $C --checkpoint-dir outputs/$C/checkpoint-500 --eval-size 7405 \
+    --condition $C --checkpoint outputs/$C/checkpoint-500 --eval-size 7404 \
     --output results/$C-eval.json
 done
 ```
@@ -261,9 +261,19 @@ Confirm `evaluate.py`'s exact CLI before running — it was written in Phase 6 f
 This is the one part of the pipeline **not** smoke-tested for the paper-faithful GRPO conditions,
 because those checkpoints did not exist at handoff time. Check it on a tiny `--eval-size` first.
 
-**Eval size: use the FULL 7,405-row held-out set.** Not a subset. This matches Phase 7b and
-Phases 5-6, and the eval set is the one place where using less data buys nothing scientifically —
-it only adds a caveat to the write-up.
+**Eval size: 7,404 rows — the full held-out set less one row. Not a subset beyond that.** Why 7,404 and not 7,405 (decided 2026-07-26, matching Phase 6): `GRPOConfig` enforces
+`generation_batch_size % num_generations == 0` (`evaluate.py:38`), so at `--eval-batch-size 4`
+the row count must be even. 7,405 is odd and produces a hard `ValueError` on the ragged final
+batch. Running 7,405 IS possible at `--eval-batch-size 2`, but measured cost is ~24 h for the two
+GRPO arms versus ~6.5 h at batch 4 — about 17 extra hours to gain one row, which is 0.0135% of the
+set and can move EM by at most 0.00013.
+
+**Use 7,404 for all five arms, including the PPO ones**, which have no such constraint. Scoring
+GRPO on 7,404 and PPO on 7,405 would put the arms on different data, and identical rows
+everywhere is worth more to this comparison than one extra row on three of them.
+
+Beyond that one row, do not subset: the eval set is the one place where using less data buys
+nothing scientifically and only adds a caveat to the write-up.
 
 Budget honestly, but do not pre-emptively shrink it:
 
