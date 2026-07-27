@@ -310,7 +310,11 @@ def paper_grpo_outcome_reward(
     for completion, answers in zip(completions, golden_answers, strict=True):
         reward = paper_binary_outcome_reward(completion, answers)
         rewards.append(reward)
+        prediction = _extract_answer(completion) or ""
         log_metric("exact_match", reward)
+        # f1 is logged even though this arm's REWARD is binary: it is a reported metric, not an
+        # optimization target, and the five-arm table needs the same columns for every arm.
+        log_metric("f1", max(f1_score(prediction, answer) for answer in answers))
         log_metric(
             "format_compliance_rate", 1.0 if _extract_answer(completion) is not None else 0.0
         )
@@ -346,9 +350,18 @@ def paper_grpo_merged_reward(
         environments = [None] * len(completions)
 
     rewards = []
-    for completion, outcome, environment in zip(completions, outcomes, environments, strict=True):
+    for completion, answers, outcome, environment in zip(
+        completions, golden_answers, outcomes, environments, strict=True
+    ):
         retrieval_fraction = getattr(environment, "retrieval_fraction", 0.0)
         rewards.append(outcome + PAPER_RETRIEVAL_BONUS * retrieval_fraction)
+        # exact_match and f1 must be logged here even though this arm's reward is the graded R^O:
+        # EM is the headline metric of the whole comparison, and without this the grpo_mr arm
+        # would finish a full training run reporting no EM at all. Caught by running the eval
+        # determinism gate and noticing grpo_or emitted eval_exact_match while grpo_mr would not.
+        prediction = _extract_answer(completion) or ""
+        log_metric("exact_match", float(any(exact_match(prediction, a) for a in answers)))
+        log_metric("f1", max(f1_score(prediction, a) for a in answers))
         log_metric("retrieval_fraction", retrieval_fraction)
         log_metric(
             "format_compliance_rate", 1.0 if _extract_answer(completion) is not None else 0.0

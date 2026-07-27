@@ -410,3 +410,38 @@ def test_paper_grpo_rewards_have_within_group_variance_when_answers_differ():
 
     assert len(set(all_wrong)) == 1  # zero variance -> no gradient from this group
     assert len(set(mixed)) == 2
+
+
+def test_paper_grpo_rewards_log_every_metric_the_comparison_needs():
+    """Both GRPO arms must log the same metric set, or the five-arm table has holes.
+
+    paper_grpo_merged_reward originally logged retrieval_fraction and format_compliance_rate but
+    NOT exact_match -- so the grpo_mr arm would have finished a full 500-step run reporting no
+    exact match at all, the headline metric of the entire comparison. Caught by the eval
+    determinism gate, where grpo_or emitted eval_exact_match and grpo_mr would not have.
+    """
+    from turn_level_rewards.rewards import paper_grpo_merged_reward, paper_grpo_outcome_reward
+
+    class _Env:
+        retrieval_fraction = 0.5
+
+    completions = [[{"role": "assistant", "content": "<answer>Knox County Airport</answer>"}]]
+    golden = [["Knox County Regional Airport"]]
+
+    for reward_fn, kwargs in (
+        (paper_grpo_outcome_reward, {}),
+        (paper_grpo_merged_reward, {"environments": [_Env()]}),
+    ):
+        logged: dict[str, list[float]] = {}
+
+        def record(name: str, value: float, sink: dict = logged) -> None:
+            sink.setdefault(name, []).append(value)
+
+        reward_fn(completions, golden, log_metric=record, **kwargs)
+        assert "exact_match" in logged, f"{reward_fn.__name__} must log exact_match"
+        assert "f1" in logged, f"{reward_fn.__name__} must log f1"
+        assert "format_compliance_rate" in logged, f"{reward_fn.__name__} must log format rate"
+        # A near-miss answer: EM is 0 but F1 is high -- the exact case that makes reporting both
+        # worthwhile, and the rigidity the paper cites as its reason for adding a judge.
+        assert logged["exact_match"] == [0.0]
+        assert logged["f1"][0] == pytest.approx(0.857, abs=0.01)
