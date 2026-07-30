@@ -2,9 +2,15 @@
 
 **PPO-OR · PPO-MR · MT-PPO · GRPO-OR · GRPO-MR — all under the paper's own reward design.**
 
-**Status**: `ppo` (PPO-OR) is COMPLETE — it collapsed, and that is its result (see §12).
-**Four arms remain to train**: `ppo_mr`, `mt_ppo`, `grpo_or`, `grpo_mr`. Everything is
-implemented, committed, and verified to 100 steps per arm.
+**Status: EXECUTED, 2026-07-27 → 2026-07-30. All five arms trained and evaluated on the full
+7,404-row held-out set. See §13 (Results) and §14 (Handoff notes) — read those first; §§1-12
+below are the pre-execution plan, preserved as written.**
+
+Headline: two of the five arms (`ppo`, `grpo_or` — both binary-outcome-only) collapsed into
+zero-gradient absorbing states. The three merged-reward arms all trained cleanly and landed in a
+narrow EM band of 0.274-0.301. The paper's own MT-PPO-over-PPO-MR claim did **not** reproduce
+(−0.027 EM), but that test is underpowered at one seed exactly as §2 predicted, and is reported
+as unresolved rather than refuted.
 
 ## STOP CONDITIONS — read before doing anything
 
@@ -688,3 +694,284 @@ usable gradient, while at 4 an all-zero stretch gives literally zero gradient an
 random-walks into the absorbing state. That makes our PPO-OR a weaker baseline than the paper's,
 which must be said when interpreting the `ppo → ppo_mr` delta: it will measure "the baseline died",
 not "the merged reward helps by X". In the paper that delta is +0.001.
+
+---
+
+## 13. Results — executed 2026-07-27 → 2026-07-30
+
+All five arms, seed 42, 500 steps, evaluated on the identical 7,404 held-out rows with greedy
+decoding on both eval paths (`evaluate_ppo.py` `do_sample=False`; `evaluate.py` `top_k=1`).
+
+### 13a. The five-arm table
+
+| Arm | EM | F1 | Format | Retrieval | Verdict |
+|---|---|---|---|---|---|
+| `ppo` (PPO-OR) @ ckpt-50 *(pre-collapse)* | 0.0016 | 0.0019 | **0.0027** | 0.5285 | collapsed |
+| `ppo` (PPO-OR) @ ckpt-100 | (see §14) | | | | collapsed |
+| `ppo_mr` (PPO-MR) | **0.3012** | **0.3945** | 0.8170 | 0.5189 | healthy |
+| `mt_ppo` (MT-PPO) | 0.2743 | 0.3621 | **0.8296** | 0.5205 | healthy |
+| `grpo_or` (GRPO-OR) | 0.0000 | 0.0154 | 0.4209 | — | collapsed |
+| `grpo_mr` (GRPO-MR) | 0.2954 | 0.3909 | **0.9750** | 0.4745 | healthy |
+
+Anchors (paper Table 2, HotpotQA): GRPO-OR 0.331/0.513 · GRPO-MR 0.416 · PPO-OR 0.435/0.916 ·
+PPO-MR 0.436 · MT-PPO 0.453/0.998.
+
+**Every arm undershoots the paper's EM.** The healthy arms land at 0.27-0.30 against 0.42-0.45.
+Format, by contrast, is close (0.82-0.98 against 0.92-1.00). That split is the expected shape of
+the batch-size deviation: format is a dense per-episode signal that saturates in 500 updates,
+while EM is sparse and hard and is what the paper's 128x data advantage actually buys.
+
+### 13b. What the within-track ablations measure
+
+| Comparison | Delta | Paper's | Reading |
+|---|---|---|---|
+| `ppo` → `ppo_mr` | **+0.300 EM** | +0.001 | Value of the added reward signal. Enormous here only because our baseline died; theirs did not. Measures "the baseline collapsed", NOT "merged reward helps by 0.30". |
+| `ppo_mr` → `mt_ppo` | **−0.027 EM** | +0.017 | Turn-level placement (Eq. 9) — the paper's own claim. Did not reproduce. **Underpowered, not refuted** (see 13d). |
+| `grpo_or` → `grpo_mr` | **+0.295 EM** | +0.085 | Same caveat as `ppo → ppo_mr`: baseline collapse, not a like-for-like effect size. |
+
+**Eq. 9's effect splits by metric, which is more informative than the bare EM number.** Turn-level
+placement is *ahead* on format (0.8296 vs 0.8170) and retrieval (0.5205 vs 0.5189) but *behind* on
+EM (−0.027) and F1 (−0.032). `R^I` directly pays for per-turn format and retrieval, so placing it
+at turn boundaries sharpened exactly those behaviours — and did not convert them into better final
+answers, which only `R^O` pays for.
+
+### 13c. The two collapses — the phase's most robust finding
+
+Two arms, two different algorithms, same reward class (binary outcome only, no format term, λs=0
+by the paper's own §6.1 definition), same structural death.
+
+`grpo_or`, from `logs/p7c-grpo_or.log`:
+
+```
+steps   0- 99  reward +0.1750  zero_std 0.620  grad_norm  4.6116  entropy 1.156
+steps 100-199  reward +0.1450  zero_std 0.720  grad_norm  9.0968  entropy 1.004
+steps 200-299  reward +0.0000  zero_std 1.000  grad_norm  0.0000  entropy 1.477
+steps 300-399  reward +0.0000  zero_std 1.000  grad_norm  0.0000  entropy 1.552
+steps 400-499  reward +0.0000  zero_std 1.000  grad_norm  0.0000  entropy 1.435
+```
+
+Last nonzero reward at **step 184**; then `frac_reward_zero_std` = 1.000 and `grad_norm` **exactly
+0.0000** for 300 consecutive steps. `checkpoint-450` and `checkpoint-500` are byte-identical,
+confirming the weights had fully settled. Held-out `tools/call_frequency` = **0.0**: across all
+7,404 questions the frozen policy never called `search` once.
+
+`ppo` (§12, plus held-out confirmation here): format **0.0027** with the *highest* retrieval of any
+arm (**0.5285**). It learned to search — better than either healthy PPO arm — and then essentially
+never emitted an `<answer>` tag. EM 0.0016 is the consequence.
+
+Mechanism, identical in both: an all-zero reward batch carries no information. PPO routes that
+through a critic learning V=0 → advantage 0; GRPO through a group std of 0 → advantage 0. Neither
+recovers, because a zero gradient cannot move the policy that produced it.
+
+**This resolves §9's `retrieval_fraction` anomaly.** Phase 7b found `mt_ppo`'s retrieval below
+`ppo`'s and could not explain it. It persists (0.5205 vs 0.5285) and is now explained: high
+retrieval is what a search-forever-never-answer policy looks like. Retrieval is only meaningful
+conditional on answering. Not evidence against the turn reward.
+
+**And it retires the assumption this repo was founded on.** `CLAUDE.md` deviated from the paper's
+binary EM reward on the *prediction* that binary rewards starve GRPO of gradient; §4 measured
+`frac_reward_zero_std` at 0.50 over 100 steps and softened that to "costs about half the signal".
+Over a full 500 steps the original prediction was right, just non-linear in time: the arm survives
+on partial signal for ~180 steps, then crosses into a state it provably cannot leave. `grpo_mr`,
+identical but for the reward, never exceeded `zero_std` 0.42 and rose monotonically to reward
++0.566.
+
+### 13d. What these runs can and cannot claim
+
+**Eval measurement error is zero.** Both PPO evals were run twice (once before the format fix,
+once after) on the same checkpoints and rows. EM, F1 and retrieval reproduced **bit-identically to
+16 decimal places** for both `ppo_mr` and `mt_ppo`. Greedy decoding has no sampling step to
+amplify bf16 noise, so §11's training-trajectory nondeterminism does not propagate to evaluation.
+
+**Therefore the −0.027 EM gap on Eq. 9 carries no measurement noise — all of its uncertainty is
+single-seed training variance, which one seed cannot estimate.** Per §2 this is an underpowered
+test and must not be reported as evidence against turn-level placement. Concretely: detecting the
+paper's +1.7-point effect needs the SE of the mean difference below ~0.85 points; at a plausible
+2-3 point seed SD that is 6-12 seeds, i.e. 110-220 GPU-hours at ~18 h per seed for the two arms.
+Not viable here, and the paper's own PPO-OR→PPO-MR delta is +0.1 points, so the effect is marginal
+even at 8xH100 scale.
+
+**Cross-track (PPO vs GRPO) numbers are NOT comparable, and this is a correction to §2.** §2
+claims five arms validate the cross-algorithm comparison; §3 and §6a of the same document say the
+tracks' batch settings are not comparable and should not be forced to match. §3/§6a are correct
+and §2 overreached. Four things differ besides the reward:
+
+| | PPO arms | GRPO arms |
+|---|---|---|
+| Inner passes per batch | `num_ppo_epochs=4` | `num_iterations=2` |
+| Second optimizer group | `critic_lr=1e-5` | none (no critic) |
+| Reward function | `R^O + Σ R^I`, with per-turn format **and λs=0.1 search penalty** | `R^O + 0.3 × retrieval_fraction`, **neither** |
+| **Distinct training prompts** | **1,964 / 1,980 (measured)** | **~250** |
+
+The last row is decisive: GRPO at `num_generations=8` spends a whole generation batch on one
+prompt and `num_iterations=2` reuses it, so the PPO arms trained on ~8x more distinct questions.
+That is a data-volume difference confounded with the algorithm.
+
+What IS matched across all five arms, and what makes the *results table* legitimate: model, seed,
+step count, `max_completion_length`, `max_tool_calling_iterations=4`, `beta=0`, 8-bit AdamW, policy
+LR 1e-6, retrieval corpus, the identical 7,404 eval rows, and greedy deterministic decoding. The
+metrics are computed by the same `metrics.py`/`rewards.py` functions for both tracks. So the arms
+can be tabulated together; only *causal attribution across tracks* is off-limits.
+
+Report as observation, not result: all three merged-reward arms converged into 0.274-0.301 EM
+despite the confounds, and the paper's +10.4-point PPO-over-GRPO gap does not appear. We cannot
+diagnose that non-reproduction from these runs.
+
+### 13e. Validity evidence — why this table is trustworthy where Phase 7b's was not
+
+| Check | `ppo_mr` | `mt_ppo` | Why it matters |
+|---|---|---|---|
+| Steps completed | 500/500 | 500/500 | — |
+| **`ended_on_tool`** | **0 / 1,964** | **0 / 1,980** | The answer-turn defect cost Phase 7b 21-58% of episodes. Zero recurrence in 3,944 episodes. |
+| Skipped steps | 9 (1.8%) | 5 (1.0%) | **491 vs 495 real gradient updates.** Phase 7b's fatal asymmetry was 431 vs 499. |
+| Peak GPU | 24.13 GB | 24.02 GB | 0.11 GB apart — memory-symmetric. |
+| Mean tool turns/ep | 2.04 | 2.05 | λs search penalty holding both at ~2 vs `ppo`'s 4.0. |
+| Wall-clock | 4.72 h | 3.72 h | — |
+
+All four §6 gates passed on both PPO arms for the full run, checked at steps 100 and 300 as
+prescribed. `grpo_or`'s collapse is a genuine result, not a gate failure to work around — it was
+reported rather than retried, per stop condition #3.
+
+### 13f. Is 500 steps enough? (§2 asked; answered)
+
+**Yes for the PPO arms — they converged rather than truncated.** Both are flat across their final
+200 steps: `ppo_mr` reward +0.299 → +0.296 and retrieval 0.531 → 0.501; `mt_ppo` reward +0.209 →
++0.209 and retrieval 0.494 → 0.512. Format was still inching up (`ppo_mr` 0.833 → 0.846) but the
+arms plateaued well below the anchor, which points at the batch-size deviation rather than step
+count. `grpo_mr` was still rising at step 500 (reward +0.445 → +0.566), so it is the one arm where
+more steps might buy something. **No extension was run** — §2 forbids extending on own initiative.
+
+
+---
+
+## 14. Handoff notes — 2026-07-27 → 2026-07-30
+
+### 14a. What was run
+
+Four arms trained (`ppo` was NOT re-trained, per stop condition #0), all at seed 42, 500 steps,
+exactly the commands in §3 with no hyperparameter changed:
+
+| Arm | Steps | Wall-clock | Outcome |
+|---|---|---|---|
+| `ppo_mr` | 500/500 | 4.72 h | healthy, all four §6 gates passed |
+| `mt_ppo` | 500/500 | 3.72 h | healthy, all four §6 gates passed |
+| `grpo_or` | 500/500 | 0.88 h | **collapsed at step 184** |
+| `grpo_mr` | 500/500 | 0.83 h | healthy, still rising at step 500 |
+
+Then six evaluations on the identical 7,404 held-out rows. Results in §13.
+
+Total: ~10.2 h training, ~35 h evaluation (including a deliberate re-run, see 14c).
+
+### 14b. THE MODEL-SIZE FINDING — read this before comparing anything to the paper again
+
+**This repo never recorded the paper's base model, and it matters more than any other deviation.**
+Verified by reading arXiv:2505.11821v2 §6.2 directly:
+
+> *"We use **Qwen2.5-7B** as the base model, **E5** as the retriever, and 2018 Wikipedia dump as
+> the corpus. We set the number of retrieved passages to **3**, and the maximum number of turns
+> N_max to **4**."*
+
+We use **Qwen3.5-0.8B** — ~8.75x fewer parameters. The paper's own Table 2 gives untrained
+baselines on HotpotQA, and they are the decisive numbers:
+
+| HotpotQA | EM | Format |
+|---|---|---|
+| Qwen2.5-7B-Base (untrained) | 0.160 | 0.098 |
+| Qwen2.5-7B-Instruct (untrained) | 0.292 | 0.109 |
+| **This repo's best trained arm (`ppo_mr`)** | **0.301** | 0.817 |
+
+**Our fully-trained 0.8B model lands roughly where their model starts.** Every "we undershoot the
+anchor by ~0.15 EM" observation in this repo should be read against that, not against batch size
+alone.
+
+**Batch size and model size are not competing explanations — they are multiplicative.** The
+collapse trigger is the probability that a batch contains zero correct answers, `(1-p)^N`:
+
+- Paper: p ≈ 0.16 at init, N = 512 → `(0.84)^512` ≈ 0. An all-zero batch essentially never occurs.
+- Here: small p (weaker model, and BM25 instead of E5 lowers it further) AND small N (4 rollouts,
+  or 8 samples of a single prompt) → all-zero batches are common. `grpo_or`'s measured
+  `frac_reward_zero_std` of 0.62 IS that quantity, observed directly.
+
+Model size lowers `p`; batch size lowers `N`; they compound in the same exponent. State the
+collapse attribution as both, with `(1-p)^N` as the mechanism.
+
+**A larger-batch probe was considered and rejected on these grounds** — it moves `N` while leaving
+`p` low, so it could not isolate the cause. Not worth the GPU time.
+
+**Also from §6.2, for the record:**
+- `topk=3` retrieved passages — **matches** this repo's `SearchEnv` default exactly.
+- `N_max = 4` turns — **matches** `max_tool_calling_iterations=4`.
+- E5 **dense** retriever vs this repo's BM25 — a third contributor to lower `p`, previously
+  documented in `CLAUDE.md` as a cost/complexity choice but never counted as an accuracy deviation.
+- Figure 3's caption: *"variability across **five independent runs**."* The paper's own curves are
+  n=5. That is independent confirmation that n=1 is below the bar for the Eq. 9 claim.
+
+### 14c. A real bug found and fixed: PPO eval never recorded format compliance
+
+`evaluate_ppo.py` computed EM, F1 and `retrieval_fraction` but **not** format compliance, so the
+PPO half of §2's anchor table could not be filled from held-out data. `_rollout_episode` returns
+`turn_format_ok` (per-turn), and the eval loop kept only three fields off each rollout — the
+metric was simply never plumbed through. GRPO had it all along because TRL's `GRPOTrainer` logs
+`eval_format_compliance_rate` for free.
+
+Fixed by routing it through `rewards.py`'s `format_reward` via the same `log_metric` callback that
+`outcome_reward` already uses for EM/F1. That choice is load-bearing: **both tracks now derive
+format from the identical `_extract_answer`**, so a PPO number and a GRPO number belong in one
+column without a caveat. Also added to `merge_shard_metrics`' weighted keys and to the progress
+line. Two unit tests added (200 pass, ruff + ty clean).
+
+Completions are not persisted, so there was no post-hoc path — all four PPO evals were re-run.
+Pre-fix results are preserved in `results/_preformat/` and agree exactly (see 14d).
+
+### 14d. Evaluation is bit-reproducible; training is not
+
+Because the PPO evals ran twice on the same checkpoints and rows, this phase accidentally produced
+a clean determinism measurement:
+
+```
+ppo_mr   exact_match  0.3011885467314965  ==  0.3011885467314965
+mt_ppo   exact_match  0.27431118314424635 ==  0.27431118314424635
+         (f1 and retrieval_fraction likewise identical to 16 dp)
+```
+
+§11 established that *training* trajectories diverge under bf16 because sampling amplifies sub-1%
+logit noise into different token choices. Greedy decoding has no such amplifier — argmax is robust
+to that perturbation — so **evaluation is exactly repeatable even though training is not**.
+
+Consequence: the −0.027 EM gap on Eq. 9 carries **zero** measurement noise. All of its uncertainty
+is single-seed training variance. Re-measuring would tell us nothing; only more seeds would.
+
+### 14e. §2 overreached on cross-track comparability — corrected in §13d
+
+§2 claims the five arms validate the paper's cross-algorithm comparison. §3 and §6a of the same
+document say the tracks' batch settings are not comparable and must not be forced to match. **§3
+and §6a are right; §2 is wrong.** Measured: the PPO arms trained on 1,964/1,980 distinct prompts,
+the GRPO arms on ~250 — an ~8x data difference confounded with the algorithm, plus differing inner
+passes, an extra optimizer group, and reward functions that are not the same function.
+
+The *results table* is still legitimate — identical rows, identical metric code, greedy decoding
+on both paths — so all five arms can be tabulated together. Only **causal attribution across
+tracks** is off-limits. This should have been caught before launch under stop condition #1 rather
+than at write-up time; it cost nothing here because the within-track ablations were unaffected,
+but it is exactly the class of thing that stop condition exists to catch.
+
+**Implication for Phase 7d**: 7d as written ("re-run GRPO under the paper's rewards") is largely
+what 7c already did. What actually remains for a valid cross-algorithm comparison is (a) equalize
+distinct training prompts across tracks and (b) reconcile the two reward functions —
+`paper_grpo_merged_reward` lacks the λs search penalty and per-turn format term the PPO arms carry.
+7d should be rescoped to those two items.
+
+### 14f. Open items, unchanged or newly noted
+
+- **§9's `retrieval_fraction` anomaly is RESOLVED** — see §13c. High retrieval on a collapsed arm
+  is what search-forever-never-answer looks like; retrieval is only meaningful conditional on
+  answering. Not evidence against the turn reward.
+- **`CollapseMonitor`'s format-collapse alert is still mis-calibrated** (§6). Untouched.
+- **`grpo_or`'s pre-collapse checkpoint was lost to `save_total_limit=3`** (collapse at step 184;
+  only 400/450/500 survive, all frozen and post-collapse). §6c warned of exactly this. Lower
+  priority than it first appeared: on the PPO side, where a pre-collapse checkpoint *was*
+  preserved, `ppo` @ ckpt-50 scored EM 0.0016 / format 0.0027 — there was never a healthy
+  binary-reward policy to capture.
+- **Matplotlib visuals and the README results section remain pending** (Phase 7b deliverables).
+  `results/phase7c-summary.json` consolidates every arm's held-out metrics for that purpose.
+- **No additional seeds were run**, per stop conditions #2 and #6b.

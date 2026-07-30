@@ -1,0 +1,9 @@
+{
+  "exact_match": 0.29740680713128037,
+  "f1": 0.38836144892800717,
+  "format_compliance_rate": 0.809967585089141,
+  "retrieval_fraction": 0.5164100486223663,
+  "num_examples": 2468,
+  "complete": true,
+  "shard": 0
+}
