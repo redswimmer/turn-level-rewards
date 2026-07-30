@@ -283,6 +283,27 @@ def paper_turn_reward(
     return reward - search_penalty_weight * cumulative_searches
 
 
+def paper_baseline_turn_reward(found_gold: bool) -> float:
+    """R^I for the paper's PPO-MR / GRPO-MR *baselines*: retrieval correctness ONLY.
+
+    This is deliberately NOT paper_turn_reward. Section 6.1 defines the MR baselines as
+    "the trajectory-level reward combines intermediate rewards (RETRIEVAL CORRECTNESS) and
+    outcome rewards (answer correctness and format correctness)" -- the intermediate term is
+    retrieval and nothing else. The per-turn format bonus and the lambda_s search penalty are
+    introduced in Section 5.2 as part of MT-PPO's OWN turn-level design ("MT-PPO (ours): ...the
+    turn-level reward design is described in Section 5.2, with lambda_s = 0.1 by default"), and
+    footnote 1 confirms the GRPO baselines "correspond to the PPO baselines with the same reward
+    design".
+
+    So the search penalty and per-turn format are MT-PPO's contribution, not baseline components.
+    Giving them to a PPO-MR arm makes it a flattened MT-PPO rather than the paper's PPO-MR --
+    which is exactly the deviation the `ppo_mr` condition carries, and why `ppo_mr_paper` exists
+    alongside it. Keeping the two as separate functions rather than one parameterised function is
+    intentional: the difference between them IS the finding, and it should be readable.
+    """
+    return PAPER_RETRIEVAL_BONUS if found_gold else 0.0
+
+
 def paper_grpo_outcome_reward(
     completions: list[Completion],
     golden_answers: list[list[str]],

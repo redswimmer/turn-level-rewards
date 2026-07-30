@@ -41,12 +41,13 @@ from turn_level_rewards.env import SearchEnv
 from turn_level_rewards.rewards import (
     TURN_REWARD_SCALE,
     _extract_answer,
+    paper_baseline_turn_reward,
     paper_binary_outcome_reward,
     paper_outcome_reward,
     paper_turn_reward,
 )
 
-Condition = Literal["ppo", "ppo_mr", "mt_ppo"]
+Condition = Literal["ppo", "ppo_mr", "ppo_mr_paper", "mt_ppo"]
 
 MODEL_NAME = "Qwen/Qwen3.5-0.8B"
 
@@ -406,7 +407,7 @@ def place_paper_rewards(
     per_token_rewards = [0.0] * num_tokens
     per_token_rewards[-1] += outcome_reward_value
 
-    if condition == "ppo_mr":
+    if condition in ("ppo_mr", "ppo_mr_paper"):
         per_token_rewards[-1] += sum(turn_rewards)
     elif condition == "mt_ppo":
         for token_index, turn_reward_value in zip(
@@ -1041,6 +1042,14 @@ class MTPPOTrainer(Trainer):
             # R^I per intermediate turn. found_gold is the MARGINAL retrieval gain, not the
             # cumulative value: SearchEnv.retrieval_fraction only ever grows, so "ground truth in
             # results" for THIS turn means the fraction rose during it.
+            #
+            # ppo_mr_paper uses the paper's BASELINE R^I -- retrieval correctness only. The
+            # per-turn format bonus and the lambda_s search penalty belong to MT-PPO's own
+            # Section 5.2 design, not to the PPO-MR baseline of Section 6.1; see
+            # paper_baseline_turn_reward's docstring for the quotes. ppo_mr keeps the full R^I
+            # deliberately, so that ppo_mr -> mt_ppo varies ONLY reward placement -- a cleaner
+            # isolation of Eq. 9 than the paper's own comparison, but NOT a reproduction of it.
+            # Both arms exist precisely so the difference is measurable rather than assumed.
             previous_fraction = 0.0
             turn_rewards = []
             for fraction, format_ok, n_search in zip(
@@ -1049,13 +1058,17 @@ class MTPPOTrainer(Trainer):
                 rollout["cumulative_searches_after_each_turn"],
                 strict=True,
             ):
-                turn_rewards.append(
-                    paper_turn_reward(
-                        found_gold=fraction > previous_fraction,
-                        format_ok=format_ok,
-                        cumulative_searches=n_search,
+                found_gold = fraction > previous_fraction
+                if self.condition == "ppo_mr_paper":
+                    turn_rewards.append(paper_baseline_turn_reward(found_gold=found_gold))
+                else:
+                    turn_rewards.append(
+                        paper_turn_reward(
+                            found_gold=found_gold,
+                            format_ok=format_ok,
+                            cumulative_searches=n_search,
+                        )
                     )
-                )
                 previous_fraction = fraction
 
             format_r = 1.0 if _extract_answer(completion) is not None else 0.0
@@ -1639,7 +1652,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train multi-turn PPO/MT-PPO (see CLAUDE.md and docs/phase-7-mt-ppo.md)."
     )
-    parser.add_argument("--condition", required=True, choices=["ppo", "ppo_mr", "mt_ppo"])
+    parser.add_argument(
+        "--condition", required=True, choices=["ppo", "ppo_mr", "ppo_mr_paper", "mt_ppo"]
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-size", type=int, default=8)
     parser.add_argument("--max-steps", type=int, default=2)

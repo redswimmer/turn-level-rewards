@@ -445,3 +445,35 @@ def test_paper_grpo_rewards_log_every_metric_the_comparison_needs():
         # worthwhile, and the rigidity the paper cites as its reason for adding a judge.
         assert logged["exact_match"] == [0.0]
         assert logged["f1"][0] == pytest.approx(0.857, abs=0.01)
+
+
+def test_paper_baseline_turn_reward_is_retrieval_only():
+    """The paper's PPO-MR/GRPO-MR baselines take retrieval correctness as their ONLY intermediate
+    reward. The per-turn format bonus and the lambda_s search penalty are MT-PPO's own Section 5.2
+    contribution -- giving them to an MR baseline turns it into a flattened MT-PPO.
+
+    Pinned as a test because this exact confusion made Phase 7c's `ppo_mr` a non-reproduction of
+    the paper's PPO-MR, and the two arms now differ only by which of these functions they call.
+    """
+    from turn_level_rewards.rewards import PAPER_RETRIEVAL_BONUS, paper_baseline_turn_reward
+
+    assert paper_baseline_turn_reward(found_gold=True) == PAPER_RETRIEVAL_BONUS
+    assert paper_baseline_turn_reward(found_gold=False) == 0.0
+
+
+def test_paper_baseline_turn_reward_ignores_format_and_search_count():
+    """Same inputs that move paper_turn_reward must NOT move the baseline variant."""
+    from turn_level_rewards.rewards import paper_baseline_turn_reward, paper_turn_reward
+
+    # paper_turn_reward is sensitive to format and cumulative searches...
+    assert paper_turn_reward(
+        found_gold=True, format_ok=True, cumulative_searches=1
+    ) != paper_turn_reward(found_gold=True, format_ok=False, cumulative_searches=3)
+
+    # ...the baseline has no such terms to be sensitive to, so retrieval alone determines it.
+    assert paper_baseline_turn_reward(found_gold=True) == paper_baseline_turn_reward(
+        found_gold=True
+    )
+    # And it is strictly the retrieval term: never negative, unlike a search-penalised turn.
+    assert paper_baseline_turn_reward(found_gold=False) == 0.0
+    assert paper_turn_reward(found_gold=False, format_ok=False, cumulative_searches=4) < 0.0
