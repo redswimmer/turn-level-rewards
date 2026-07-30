@@ -25,7 +25,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
 
 from turn_level_rewards import data
-from turn_level_rewards.rewards import Completion, outcome_reward
+from turn_level_rewards.rewards import Completion, format_reward, outcome_reward
 from turn_level_rewards.train_ppo import (
     MODEL_NAME,
     MTPPOTrainer,
@@ -63,18 +63,28 @@ def aggregate_eval_metrics(
     per-example exact_match/f1 selection logic (via its log_metric callback) so eval-time
     scoring is byte-for-byte identical to training-time scoring -- no separate reimplementation
     of the "max over golden_answers" argmax logic to drift out of sync with rewards.py.
+
+    format_compliance_rate comes from format_reward for the same reason, and it matters for
+    comparability rather than mere convenience: the paper reports format correctness as a
+    headline metric alongside EM (Table 2: MT-PPO 0.998, PPO-OR 0.916, GRPO-OR 0.513), and the
+    GRPO track already gets it held-out because TRL's GRPOTrainer logs it. Routing it through
+    format_reward means both tracks' figures come from the SAME _extract_answer definition, so
+    a PPO number and a GRPO number can be put in one column without a caveat.
     """
-    logged: dict[str, list[float]] = {"exact_match": [], "f1": []}
+    logged: dict[str, list[float]] = {"exact_match": [], "f1": [], "format_compliance_rate": []}
 
     def log_metric(name: str, value: float) -> None:
         logged[name].append(value)
 
     outcome_reward(completions, golden_answers_list, log_metric=log_metric)
+    # Rewards discarded -- only the logged per-completion compliance flags are wanted here.
+    format_reward(completions, log_metric=log_metric)
 
     num_examples = len(completions)
     return {
         "exact_match": sum(logged["exact_match"]) / num_examples,
         "f1": sum(logged["f1"]) / num_examples,
+        "format_compliance_rate": sum(logged["format_compliance_rate"]) / num_examples,
         "retrieval_fraction": sum(retrieval_fractions) / num_examples,
         "num_examples": num_examples,
     }
@@ -127,7 +137,7 @@ def merge_shard_metrics(shard_metrics: list[dict]) -> dict:
     total = sum(m["num_examples"] for m in shard_metrics)
     weighted = {
         key: sum(m[key] * m["num_examples"] for m in shard_metrics) / total
-        for key in ("exact_match", "f1", "retrieval_fraction")
+        for key in ("exact_match", "f1", "format_compliance_rate", "retrieval_fraction")
     }
     return {**weighted, "num_examples": total, "num_shards": len(shard_metrics)}
 
@@ -204,7 +214,8 @@ def run_eval(
                 remaining = (elapsed / index) * (len(rows) - index)
                 print(
                     f"{index}/{len(rows)} rows | em={running['exact_match']:.3f} "
-                    f"f1={running['f1']:.3f} retr={running['retrieval_fraction']:.3f} | "
+                    f"f1={running['f1']:.3f} fmt={running['format_compliance_rate']:.3f} "
+                    f"retr={running['retrieval_fraction']:.3f} | "
                     f"{elapsed / index:.2f}s/row eta={remaining / 3600:.1f}h",
                     flush=True,
                 )

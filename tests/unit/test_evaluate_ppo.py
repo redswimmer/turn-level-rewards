@@ -29,6 +29,27 @@ def test_aggregate_eval_metrics_computes_means():
     assert metrics["retrieval_fraction"] == 0.75  # mean of 1.0, 0.5
     assert metrics["num_examples"] == 2
     assert 0.0 <= metrics["f1"] <= 1.0
+    # Both completions carry a well-formed <answer> tag, so both are format-compliant even
+    # though only one is correct -- format and correctness are independent axes, which is
+    # exactly why the paper reports them as separate columns.
+    assert metrics["format_compliance_rate"] == 1.0
+
+
+def test_aggregate_eval_metrics_counts_missing_answer_tag_as_noncompliant():
+    """The collapsed-policy case: a completion with no parseable <answer> scores 0 on format.
+
+    This is the metric that distinguishes "searched and answered wrong" from "never answered",
+    which raw EM cannot -- both score EM 0.
+    """
+    completions = [
+        [{"role": "assistant", "content": "<answer>Paris</answer>"}],
+        [{"role": "assistant", "content": "I searched but never produced a tag"}],
+    ]
+
+    metrics = aggregate_eval_metrics(completions, [["Paris"], ["London"]], [1.0, 1.0])
+
+    assert metrics["format_compliance_rate"] == 0.5
+    assert metrics["exact_match"] == 0.5
 
 
 def test_aggregate_eval_metrics_perfect_run():
@@ -163,14 +184,27 @@ def test_merge_shard_metrics_weights_by_example_count():
     """Shards can differ in size by one row, so a plain mean of shard means is wrong."""
     merged = merge_shard_metrics(
         [
-            {"exact_match": 1.0, "f1": 1.0, "retrieval_fraction": 0.5, "num_examples": 90},
-            {"exact_match": 0.0, "f1": 0.0, "retrieval_fraction": 1.0, "num_examples": 10},
+            {
+                "exact_match": 1.0,
+                "f1": 1.0,
+                "format_compliance_rate": 1.0,
+                "retrieval_fraction": 0.5,
+                "num_examples": 90,
+            },
+            {
+                "exact_match": 0.0,
+                "f1": 0.0,
+                "format_compliance_rate": 0.0,
+                "retrieval_fraction": 1.0,
+                "num_examples": 10,
+            },
         ]
     )
 
     assert merged["num_examples"] == 100
     assert merged["exact_match"] == pytest.approx(0.9)
     assert merged["retrieval_fraction"] == pytest.approx(0.55)
+    assert merged["format_compliance_rate"] == pytest.approx(0.9)
 
 
 def test_merge_shard_metrics_refuses_incomplete_shards():
