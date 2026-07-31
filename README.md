@@ -176,11 +176,20 @@ starts.
 
 | Arm (held-out, 7,404 questions) | Exact match | F1 | Format | Retrieval |
 | ------------------------------- | ----------- | ---- | ------ | --------- |
-| `PPO-OR`  | 0.002 | 0.002 | 0.003 | 0.529 |
+| `PPO-OR`* | 0.002 | 0.002 | 0.003 | 0.529 |
 | `PPO-MR`  | 0.235 | 0.301 | 0.642 | 0.551 |
 | `MT-PPO`  | **0.274** | **0.362** | **0.830** | 0.521 |
 | `GRPO-OR` | 0.000 | 0.015 | 0.421 | — |
 | `GRPO-MR` | **0.295** | **0.391** | **0.975** | 0.475 |
+
+`*` `PPO-OR` collapsed during training, so it is scored at its last checkpoint before collapse —
+the paper's own stated methodology for its crashed PPO baselines. `GRPO-OR` has no retrieval figure
+because its reward never inspects retrieval, so the metric was not computed for that arm.
+
+Six training runs (~14 GPU-hours) and seven full held-out evaluations (~45 GPU-hours) on one
+RTX 4090. Every arm ran 500 steps at seed 42 with identical hyperparameters; the arms took 488-495
+real gradient updates each, and no episode in any PPO arm ended without a chance to answer — the
+symmetry checks that make the comparison worth reading at all.
 
 ### 1. Turn-level reward reproduces — and the effect is larger here than in the paper
 
@@ -221,8 +230,8 @@ The paper's `PPO-MR → MT-PPO` step changes **two things at once**: it adds rew
 per-turn format term and a search penalty) *and* moves them to turn boundaries. So its published
 gain can't attribute credit between them.
 
-We ran the missing control: the same reward content as `MT-PPO`, but flattened to the final token.
-It scores **0.301 EM** — higher than either published arm — which separates the two changes:
+We have the missing control: the same reward content as `MT-PPO`, but flattened to the final
+token. It scores **0.301 EM** — higher than either published arm — which separates the two changes:
 
 | Change | Effect on held-out EM |
 | ------ | --------------------- |
@@ -232,9 +241,20 @@ It scores **0.301 EM** — higher than either published arm — which separates 
 
 **At this scale the reward components do the work, and turn-level placement gives some of it back.**
 The published net gain is real, but it is the sum of a large positive and a smaller negative — not a
-single effect. On sampling noise the content effect is ~9 SE and the placement effect ~3.7 SE, but
-this is n=1 seed against the paper's n=5, so we treat the content effect as solid and the placement
-effect as **suggestive, not settled**.
+single effect.
+
+Neither effect can be explained by evaluation noise: both evaluations are deterministic and
+reproduce bit-identically, and on sampling error alone the gaps are ~9 SE and ~3.7 SE. But that is
+the *wrong* error bar to lean on — the dominant uncertainty is seed-to-seed training variance, which
+one seed cannot estimate at all. So: the content effect is large enough to survive a lot of it; the
+placement effect is **suggestive, not settled**.
+
+> This control was not planned. `ppo_mr` was built as a "cleaner" PPO-MR before the paper's actual
+> definition was checked, and the error was caught only when its results were written up — at which
+> point the first pass had already concluded, wrongly, that the paper's central claim *didn't*
+> reproduce. Re-running the faithful baseline reversed that. The accidental arm turned out to be the
+> useful one, but the lesson is the opposite of comfortable: **reproduce faithfully first, then
+> improve.**
 
 ### 4. A search penalty is not what prevents runaway searching
 
@@ -251,7 +271,10 @@ term, and that — not the missing penalty — is what let it search forever.
 
 Separately from the reproduction, we stress-tested a GRPO variant using **graded** partial credit
 (F1 + exact-match bonus) instead of the paper's binary reward, under three manufactured pressures.
-Baseline: 0.242 EM outcome-only vs 0.307 merged.
+
+**These runs are not comparable to the table above** — different reward, different seed (123), and
+600 steps rather than 500. They are their own self-contained experiment, with their own internal
+baseline: **0.242 EM** outcome-only vs **0.306** merged.
 
 ![Held-out exact match across four reward configurations](results/followup_experiments_comparison.png)
 
