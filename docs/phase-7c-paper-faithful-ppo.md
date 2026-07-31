@@ -2,15 +2,24 @@
 
 **PPO-OR · PPO-MR · MT-PPO · GRPO-OR · GRPO-MR — all under the paper's own reward design.**
 
-**Status: EXECUTED, 2026-07-27 → 2026-07-30. All five arms trained and evaluated on the full
-7,404-row held-out set. See §13 (Results) and §14 (Handoff notes) — read those first; §§1-12
-below are the pre-execution plan, preserved as written.**
+**Status: EXECUTED, 2026-07-27 → 2026-07-31. Six arms trained and evaluated on the full 7,404-row
+held-out set. READ §15 FIRST — it is the corrected result. §13/§14 are the first pass and §13b's
+Eq. 9 conclusion is SUPERSEDED. §§1-12 are the pre-execution plan, preserved as written.**
 
-Headline: two of the five arms (`ppo`, `grpo_or` — both binary-outcome-only) collapsed into
-zero-gradient absorbing states. The three merged-reward arms all trained cleanly and landed in a
-narrow EM band of 0.274-0.301. The paper's own MT-PPO-over-PPO-MR claim did **not** reproduce
-(−0.027 EM), but that test is underpowered at one seed exactly as §2 predicted, and is reported
-as unresolved rather than refuted.
+Headline:
+
+1. **The paper's Eq. 9 claim REPRODUCES**: PPO-MR → MT-PPO = **+3.90 EM** (paper: +1.7), format
+   0.642 → 0.830. §13b's "did not reproduce (−0.027)" was measured against `ppo_mr`, which is
+   **not** the paper's PPO-MR — it carries MT-PPO's own `R^I`. The faithful baseline is
+   `ppo_mr_paper`, added 2026-07-31.
+2. **Two arms collapsed** (`ppo`, `grpo_or` — both binary-outcome-only) into verified
+   zero-gradient absorbing states. Two different algorithms, one structural failure.
+3. **This repo's own contribution**: keeping the deviating `ppo_mr` alongside the faithful arm
+   decomposes the paper's PPO-MR → MT-PPO step into a reward-**content** effect (**+6.59 EM**)
+   and a turn-**placement** effect (**−2.69 EM**) — a separation the paper's design cannot make,
+   because its comparison moves both at once.
+4. **λs = 0 did not cause uncontrolled search** (§15d), contra §5.2's warning — isolating the
+   binary reward's dead gradient as what actually killed `ppo`.
 
 ## STOP CONDITIONS — read before doing anything
 
@@ -975,3 +984,135 @@ distinct training prompts across tracks and (b) reconcile the two reward functio
 - **Matplotlib visuals and the README results section remain pending** (Phase 7b deliverables).
   `results/phase7c-summary.json` consolidates every arm's held-out metrics for that purpose.
 - **No additional seeds were run**, per stop conditions #2 and #6b.
+
+---
+
+## 15. ADDENDUM, 2026-07-31 — the faithful PPO-MR arm, and a reversed headline
+
+**§13b's "Eq. 9 did not reproduce" conclusion is WRONG and is corrected here.** It compared
+`mt_ppo` against `ppo_mr`, which is not the paper's PPO-MR (see §14c/§15a). Measured against the
+faithful baseline, the paper's claim reproduces.
+
+### 15a. Why a sixth arm was added
+
+Checking §6.1 against arXiv:2505.11821v2 directly showed `ppo_mr` carries MT-PPO's full `R^I` --
+the λs search penalty and the per-turn format bonus -- making it a *flattened MT-PPO*, not the
+paper's PPO-MR. The paper's MR baselines take **retrieval correctness only**:
+
+> **PPO-MR**: *"the trajectory-level reward combines intermediate rewards (retrieval correctness)
+> and outcome rewards (answer correctness and format correctness)."*
+>
+> **MT-PPO (ours)**: *"the turn-level reward design is described in Section 5.2, with λs = 0.1 by
+> default."*
+>
+> Footnote 1: *"The GRPO baselines correspond to the PPO baselines with the same reward design."*
+
+So λs and per-turn format are MT-PPO's own contribution. `grpo_mr` was faithful all along;
+`ppo_mr` was the deviation -- the opposite of what §14e assumed.
+
+`ppo_mr_paper` was added as the faithful reproduction. `ppo_mr` was **kept**, and that turned out
+to matter enormously (§15c).
+
+### 15b. The corrected result
+
+| Arm | EM | F1 | Format | Retrieval | Paper EM / Format |
+|---|---|---|---|---|---|
+| `ppo` (PPO-OR) @ ckpt-50 | 0.0016 | 0.0019 | 0.0027 | 0.5285 | 0.435 / 0.916 |
+| **`ppo_mr_paper` (PPO-MR)** | **0.2353** | **0.3013** | **0.6424** | **0.5505** | 0.436 / — |
+| `mt_ppo` (MT-PPO) | 0.2743 | 0.3621 | 0.8296 | 0.5205 | 0.453 / 0.998 |
+| `grpo_or` (GRPO-OR) | 0.0000 | 0.0154 | 0.4209 | — | 0.331 / 0.513 |
+| `grpo_mr` (GRPO-MR) | 0.2954 | 0.3909 | 0.9750 | 0.4745 | 0.416 / — |
+| *`ppo_mr` (our extension, not the paper's PPO-MR)* | *0.3012* | *0.3945* | *0.8170* | *0.5189* | *n/a* |
+
+**The paper's Eq. 9 claim reproduces**: PPO-MR → MT-PPO = **+3.90 EM** (paper: +1.7) and format
+0.642 → 0.830 (**+0.187**). Right direction, larger magnitude.
+
+### 15c. Decomposing the effect — this repo's actual contribution
+
+`ppo_mr` and `mt_ppo` share identical reward CONTENT and differ only in PLACEMENT.
+`ppo_mr_paper` and `ppo_mr` share identical PLACEMENT and differ only in CONTENT. So the three
+arms separate two things the paper's own design confounds:
+
+```
+ppo_mr_paper  0.2353   R^O + retrieval,                flattened to last token
+ppo_mr        0.3012   R^O + retrieval + format + λs,  flattened to last token
+mt_ppo        0.2743   R^O + retrieval + format + λs,  placed at turn boundaries
+```
+
+| Change | Effect on EM |
+|---|---|
+| Add λs + per-turn format **content** | **+6.59** |
+| Move that content to **turn boundaries** (Eq. 9) | **−2.69** |
+| **Net** = the paper's own PPO-MR → MT-PPO step | **+3.90** |
+
+**The paper's +1.7 is the net of a large positive content effect and a smaller negative placement
+effect.** Its PPO-MR → MT-PPO comparison changes both at once and cannot separate them. At this
+scale the reward *components* do the work, and turn-level placement gives some of it back.
+
+Statistical footing: on 7,404 rows the unpaired SE of an EM difference is ~0.72 points, so the
+content effect (+6.59) is ~9 SE and the placement effect (−2.69) ~3.7 SE on sampling noise alone.
+But n=1 seed against the paper's n=5 -- the content effect is large enough to survive substantial
+seed variance; the placement effect should be called **suggestive, not settled**.
+
+### 15d. λs = 0 did NOT produce uncontrolled search
+
+`ppo_mr_paper` runs λs = 0 by the paper's own PPO-MR definition -- exactly the configuration §5.2
+warns of (*"removing this reward term leads to... uncontrolled search usage"*). It did not happen:
+
+```
+                        turns/ep by 100-step window
+ppo_mr        (λs=0.1)  1.24  2.27  2.36  2.31  2.04
+mt_ppo        (λs=0.1)  1.42  2.00  2.34  2.10  2.39
+ppo_mr_paper  (λs=0)    1.72  2.68  2.26  2.17  2.10
+```
+
+It peaked at 2.68 and settled at **2.10**, between the two penalised arms and far from the 4-turn
+cap that `ppo` saturated. This isolates what killed `ppo`: **the binary reward's dead gradient,
+not the missing search penalty.** A working graded `R^O` bounds search on its own -- a
+wrong-but-formatted answer still earns +0.2, so there is positive pressure to stop and answer.
+
+Its one real cost is longer episodes (732 tokens vs `ppo_mr`'s 519): it searches about as often
+but spends more tokens doing it, which also made its eval ~50% slower per row.
+
+### 15e. Training validity, all three PPO arms
+
+| | `ppo_mr` | `mt_ppo` | `ppo_mr_paper` |
+|---|---|---|---|
+| Steps | 500/500 | 500/500 | 500/500 |
+| Episodes | 1,964 | 1,980 | 1,952 |
+| Skipped steps | 9 | 5 | 12 |
+| **Real gradient updates** | **491** | **495** | **488** |
+| `ended_on_tool` | 0 | 0 | 0 |
+| Peak GPU | 24.13 GB | 24.02 GB | 23.97 GB |
+| Wall-clock | 4.72 h | 3.72 h | 4.14 h |
+
+`ended_on_tool` = **0 across all 5,896 PPO episodes**. Peak GPU within 0.16 GB across arms. All
+four §6 gates passed on all three.
+
+### 15f. An eval OOM, and the safeguard that caught it
+
+`ppo_mr_paper`'s shard 2 hit `torch.OutOfMemoryError` at ~800/2,468 rows under three-way GPU
+contention. The designed safeguards all fired: the shard wrote its partial marked
+`{"complete": false}`, `merge_eval_shards.py` **refused to merge it**, and the driver exited 1.
+No partial was ever reported as a full-set number. Re-run solo → exit 0 → merged cleanly.
+
+Two notes for future runs:
+- This is the documented residual OOM risk from Phase 7 (`flash-linear-attention` cut it from
+  ~50% to ~12.5%, survivors being the catchable kind). Consistent with that, not new.
+- **Solo only improved throughput 12.5 → 9.4 s/row**, so GPU contention is NOT the sharding
+  bottleneck -- single-threaded generation is, exactly as `shard_rows`' docstring documented
+  (1 of 32 cores busy, GPU at 39-41%). More shards will not help much; the fix would be batching
+  the eval rollouts.
+
+### 15g. What this changes for the write-up
+
+The narrative is now the one the repo was always supposed to tell:
+
+1. **Faithful reproduction** — five arms under the paper's own reward definitions. Eq. 9
+   reproduces (+3.90 EM); binary-outcome-only baselines collapse at this scale; absolute EM sits
+   below the paper's because the model is ~8.75x smaller (§14b).
+2. **Our own experiment** — `ppo_mr` decomposes the paper's PPO-MR → MT-PPO step into a content
+   effect (+6.59) and a placement effect (−2.69), which the paper's design cannot separate.
+
+§13b's delta table is superseded by §15c. §14e's claim that "a true reward-parity set would mean
+removing λs from `ppo_mr`" is right, and `ppo_mr_paper` is that arm.
