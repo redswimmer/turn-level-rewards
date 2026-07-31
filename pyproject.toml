@@ -9,6 +9,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "bitsandbytes>=0.50.0",  # 8-bit AdamW optimizer states (adamw_bnb_8bit / bnb.optim.AdamW8bit).
+                             # Load-bearing for experimental validity, not just memory: without it
+                             # mt_ppo OOM-skips steps the other arms do not, so the arms receive
+                             # different numbers of real gradient updates -- the exact confound that
+                             # invalidated Phase 7b. See docs/phase-7c-paper-faithful-ppo.md section 5.
     "datasets>=5.0.0",
     "fastapi>=0.139.0",
     "flash-linear-attention==0.4.1",  # exact pin: 0.5.0 corrupts Qwen3.5 output (see phase-7-mt-ppo.md);
