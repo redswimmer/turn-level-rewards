@@ -1,12 +1,12 @@
 # Outcome vs. Turn-Level Reward for Multi-Turn Search Agents
 
-**Goal**: determine whether rewarding an AI agent's intermediate actions, not just its final
-answer, produces a measurably better multi-turn search agent.
+**Goal**: determine whether rewarding a model's intermediate actions, not just its final answer,
+produces a measurably better multi-turn search agent.
 
-**Why this matters.** RL algorithms like GRPO and PPO are the standard way to train multi-turn LLM
-agents, but they're usually trained on sparse outcome rewards: one number, right or wrong, at the
-very end of a long trajectory. That gives the agent no signal about which of its intermediate
-actions (like a good search) actually helped. The paper this repo is inspired by found that adding
+**Why this matters.** RL algorithms like GRPO and PPO are the standard way to train the language
+models that drive multi-turn agents, and they usually optimize a sparse outcome reward: one number,
+right or wrong, at the very end of a long trajectory. That gives the model no signal about which of
+its intermediate actions (like a good search) actually helped. The paper this repo is inspired by found that adding
 a dense, turn-level reward signal on top of the same algorithms fixes that: more stable training,
 faster convergence, and higher accuracy than sparse-reward baselines. This repo tests whether that
 holds up at a much smaller scale.
@@ -24,11 +24,14 @@ Retrieval is BM25 rather than the paper's dense E5. Smaller deviations are noted
 
 ## The agent
 
-This repo's agent answers a question by deciding, at each turn, whether to search a Wikipedia
-snapshot (a fixed, offline copy, not the live site) for more information or give a final answer.
-Different rollouts of the same question can end up searching a different number of times.
-Every condition below trains that identical agent and decision loop; only the reward function
-changes, so any difference in results comes from the reward design, not the architecture.
+The agent here is a **language model inside a fixed scaffold**: at each turn the model decides
+whether to search a Wikipedia snapshot (a fixed, offline copy, not the live site) or give a final
+answer. Different rollouts of the same question can end up searching a different number of times.
+
+What RL updates is only the **model's weights**. The scaffold around it — the tool-calling loop,
+the system prompt, the retrieval backend, the 4-turn cap — is identical in every condition below
+and is never trained. Only the reward function differs, so any difference in results is attributable
+to the reward design rather than to the agent's architecture.
 
 ```mermaid
 flowchart LR
