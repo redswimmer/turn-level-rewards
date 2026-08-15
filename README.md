@@ -1,4 +1,4 @@
-# Outcome vs. Turn-Level Reward for Multi-Turn Search Agents
+# Training Outcome vs. Turn-Level Reward for Multi-Turn Agents
 
 **Goal**: determine whether rewarding a model's intermediate actions, not just its final answer,
 produces a measurably better multi-turn search agent.
@@ -13,22 +13,23 @@ holds up at a much smaller scale.
 
 Inspired by ["Reinforcing Multi-Turn Reasoning in LLM Agents via Turn-Level Reward
 Design"](https://arxiv.org/abs/2505.11821) (arXiv:2505.11821), specifically its GRPO and PPO case
-study. All five reward designs below follow the paper's own definitions; experiments of our own are
+study. The reward designs below follow the paper's own definitions; experiments of our own are
 labelled as such and kept separate from the reproduction.
 
-**Biggest deviation, and it dominates the absolute numbers**: a much smaller model on a single
-consumer GPU — `Qwen3.5-0.8B` on one NVIDIA RTX 4090, vs. the paper's `Qwen2.5-7B` on 8 NVIDIA
-H100s — with a batch size 128× smaller. HotpotQA is one of the paper's own six evaluation datasets
-(its in-domain one); this repo uses it exclusively, for its genuinely multi-hop questions.
-Retrieval is BM25 rather than the paper's dense E5. Smaller deviations are noted inline.
+**Biggest deviation**: a much smaller model on a single consumer GPU — `Qwen3.5-0.8B` on one
+NVIDIA RTX 4090, vs. the paper's `Qwen2.5-7B` on 8 NVIDIA H100s — with a batch size 128× smaller.
+HotpotQA is one of the paper's own six evaluation datasets; this repo uses it exclusively, for
+its genuinely multi-hop questions. Retrieval is BM25 rather than the paper's dense E5. Every arm
+here is also a single run (n=1) against the paper's n=5, so seed-to-seed variance is unmeasured.
+Smaller deviations are noted inline.
 
-## The agent
+## The Agent
 
-The agent here is a **language model inside a fixed scaffold**: at each turn the model decides
+The agent here is a **language model inside a harness**: at each turn the model decides
 whether to search a Wikipedia snapshot (a fixed, offline copy, not the live site) or give a final
 answer. Different rollouts of the same question can end up searching a different number of times.
 
-What RL updates is only the **model's weights**. The scaffold around it — the tool-calling loop,
+What RL updates is only the **model's weights**. The harness around it — the tool-calling loop,
 the system prompt, the retrieval backend, the 4-turn cap — is identical in every condition below
 and is never trained. Only the reward function differs, so any difference in results is attributable
 to the reward design rather than to the agent's architecture.
@@ -41,10 +42,6 @@ flowchart LR
     D -- answer --> A(["Final answer"])
 ```
 
-
-
-
-
 ## Reward approaches explored
 
 GRPO computes **one** advantage per trajectory and applies that identical value to every token in
@@ -54,17 +51,11 @@ guess, get scored no differently turn-by-turn. GRPO can't isolate which turn ear
 That holds no matter *where* you attach a bonus. GRPO only ever sees one number per trajectory, so
 a bonus placed mid-episode still gets folded into that same number. Actually using *where* a reward
 happened requires a critic that can evaluate any point in a trajectory on its own. PPO has one;
-GRPO doesn't. That's why the last three approaches switch algorithms rather than just rearranging
+GRPO doesn't. That's why the last later PPO approaches switch algorithms rather than just rearranging
 the reward.
 
-Five approaches, in increasing order of how directly they solve it. All five use the paper's own
-reward definitions (arXiv:2505.11821 §5.2/§6.1), and share this outcome reward:
-
-```
-R^O  =  +1.0   correct answer, correct format
-        +0.2   wrong answer, correct format
-        −1.0   incorrect format
-```
+Each approach below uses the paper's own reward definitions (arXiv:2505.11821 §5.2/§6.1); each
+section states its exact reward.
 
 ### 1. `GRPO-OR` — outcome only
 
@@ -96,7 +87,8 @@ flowchart LR
     A2 ==> R2{{"Still ONE combined score"}}
 ```
 
-> **Reward:** `R = R^O + 0.3 × retrieval_fraction` — one scalar, still terminal.
+> **Reward:** `R = R^O + 0.3 × retrieval_fraction` — one scalar, still terminal, where
+> `R^O = +1.0` correct+format / `+0.2` wrong+format / `−1.0` bad format.
 
 The retrieval bonus checks whether a search surfaced one of the specific Wikipedia articles a human
 annotator marked as necessary, independent of whether the final answer came out right.
@@ -162,7 +154,7 @@ Those are MT-PPO's own contribution, not baseline components — which turns out
 
 ## Results
 
-All five arms: same model, same scaffold, same seed, same data, 500 steps each, evaluated on the
+Every arm below: same model, same scaffold, same seed, same data, 500 steps each, evaluated on the
 same 7,404 held-out questions. Only the reward differs.
 
 ![This reproduction against the paper's published results](results/phase7c_vs_paper.png)
@@ -270,8 +262,8 @@ incentive is genuinely risky under GRPO, and a denser reward is real but **incom
   data (~1,964 vs ~250 distinct training prompts) because GRPO must spend its whole generation batch
   on one prompt to form a group baseline. The arms belong in one table; a PPO-vs-GRPO *causal*
   claim does not follow from it.
-- **The follow-up experiments are their own track**, not comparable to the five arms: graded reward,
-  seed 123, 600 steps, with an internal baseline of 0.242 EM outcome-only vs 0.306 merged.
+- **The follow-up experiments are their own track**, not comparable to the arms above: graded
+  reward, seed 123, 600 steps, with an internal baseline of 0.242 EM outcome-only vs 0.306 merged.
 - **Retrieval ceiling.** ~20% of HotpotQA's gold passage titles aren't in this Wikipedia snapshot,
   so retrieval fraction can't reach 1.0 even with perfect search.
 
@@ -293,19 +285,11 @@ incentive is genuinely risky under GRPO, and a denser reward is real but **incom
    reproduce. It did — our own deviation was hiding it.
 
 
-## Roadmap
+## Future work
 
-- **Paper reproduction (all five reward designs).** Complete. Training and held-out evaluation done
-  for `GRPO-OR`, `GRPO-MR`, `PPO-OR`, `PPO-MR` and `MT-PPO` at seed 42, evaluated on the same
-  7,404 held-out questions (see Results above).
-- **Our own experiments.** The content-vs-placement decomposition (Result 3) and the graded-reward
-  GRPO stress tests (Result 5) are complete.
-- **Multiple seeds.** Not run. n=1 against the paper's n=5; the small placement effect would need
-  ~6-12 seeds to resolve, which is 110-220 GPU-hours on this hardware.
-- **LLM-as-judge reward.** The paper studies two kinds of turn-level reward: *verifiable* (this
-  repo's retrieval check, an objective test of whether a real supporting passage got surfaced) and
-  *LLM-as-judge* (a model scores the turn instead). The judge variant is not yet started. Note the
-  paper reports no benchmark number for its judge, so there is no published score to check against.
+- **LLM-as-judge reward.** The paper's other turn-level signal — a model scores the turn instead of
+  the verifiable retrieval check used here. Not started; the paper reports no benchmark number for
+  it either, so there's no published score to check against.
 
 ## Project structure
 
