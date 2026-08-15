@@ -157,10 +157,8 @@ differs; across the GRPO/PPO divide the algorithm differs too, by design.
 | `PPO-OR` | 0.002 | Collapsed — searched forever, stopped answering¹ |
 | `PPO-MR` | 0.235 | Worked |
 | `MT-PPO` | 0.274 | Worked — the paper's best method |
-| `PPO-MR` + MT-PPO's reward terms² | **0.301** | Worked — best arm overall |
 
 ¹ Stopped early and evaluated at its last checkpoint before collapse.
-² Our own control arm, not in the paper — see "two effects" below.
 
 ![This reproduction against the paper's published results](results/phase7c_vs_paper.png)
 
@@ -178,12 +176,10 @@ Same reward, opposite fates — the only thing that changed is scale:
 | `PPO-OR` | 0.435 EM | 0.002 EM |
 | `GRPO-OR` | 0.331 EM | 0.000 EM |
 
-![PPO-OR's format compliance falling to zero while the reward-shaped arms hold](results/phase7c_format.png)
+![Both collapses during training, next to our runs that held](results/phase7c_collapses.png)
 
 `PPO-OR` stopped answering (format compliance 0.003) while posting the best retrieval score of any
 arm (0.528). Watch only the retrieval metric and the most broken arm looks like the best one.
-
-![GRPO-OR collapsing: reward and reward-variance curves](results/phase7c_collapse.png)
 
 `GRPO-OR` died differently. When every rollout in a group scores the same, GRPO's advantage is zero
 by construction; after step 184 its gradient is exactly 0.0000 and never recovers. `GRPO-MR` is the
@@ -203,17 +199,11 @@ that penalty at zero and settles near 2 searches per episode. What actually boun
 +0.2 reward for a wrong-but-formatted answer — always something to gain by stopping and committing.
 `PPO-OR`, the arm with no such term, is the one that searched to the cap forever.
 
-### The paper's headline gain is two effects, not one
+### The paper's headline result reproduced
 
-The paper's headline result reproduced: `PPO-MR → MT-PPO` is 0.235 → 0.274 EM here, a gain of
-+0.039 against the paper's +0.017. But that step changes what the reward *contains* and *where* it
-is placed at once, so we added the control the paper lacks: MT-PPO's reward terms, still all placed
-at the end.
-
-![Waterfall decomposing the MT-PPO gain into reward content and placement](results/phase7c_decomposition.png)
-
-The content is worth +0.066; moving it to the turns loses −0.027. At n=1 the first is large enough
-to trust, the second isn't.
+`PPO-MR → MT-PPO` is 0.235 → 0.274 EM here, a gain of +0.039 against the paper's +0.017 — same
+direction, larger magnitude. Format compliance rose 0.642 → 0.830. Every arm is a single run, so
+read the direction as the reproduction and the magnitude loosely.
 
 ### Our own experiment: a narrow reward is fragile to added penalties
 

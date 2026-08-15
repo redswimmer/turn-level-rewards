@@ -178,77 +178,6 @@ def plot_vs_paper(summary: dict, out: Path) -> None:
     plt.close(fig)
 
 
-def plot_decomposition(summary: dict, out: Path) -> None:
-    """Waterfall: the paper's PPO-MR -> MT-PPO step split into reward content and placement.
-
-    A waterfall rather than three bars, because the point is that two opposing contributions sum
-    to the published net -- which grouped bars would leave the reader to compute. Bars are
-    directly labelled, so no legend box: the colours are explained by the axis labels beneath.
-    """
-    base = summary["ppo_mr_paper"]["em"]
-    mid = summary["ppo_mr"]["em"]
-    end = summary["mt_ppo"]["em"]
-    fig, (ax,) = _fig(8.6, 4.6)
-
-    w = 0.5
-    ax.bar(0, base, width=w, color=OURS)
-    ax.bar(1, mid - base, bottom=base, width=w, color=GAIN)  # rises base -> mid
-    ax.bar(2, mid - end, bottom=end, width=w, color=LOSS)  # falls mid -> end
-    ax.bar(3, end, width=w, color=OURS)
-
-    # Step connectors: each bar's exit level carried across to the next bar's entry.
-    for x, level in ((0, base), (1, mid), (2, end)):
-        ax.plot(
-            [x + w / 2, x + 1 - w / 2],
-            [level, level],
-            color=INK_SOFT,
-            linewidth=1,
-            linestyle=(0, (3, 2)),
-            zorder=0,
-        )
-
-    ax.text(0, base + 0.008, f"{base:.3f}", ha="center", fontsize=10.5, color=INK)
-    ax.text(
-        1, mid + 0.008, f"+{mid - base:.3f}", ha="center", fontsize=11, color=GAIN, weight="bold"
-    )
-    ax.text(
-        2,
-        mid + 0.008,
-        f"\u2212{mid - end:.3f}",
-        ha="center",
-        fontsize=11,
-        color=LOSS,
-        weight="bold",
-    )
-    ax.text(3, end + 0.008, f"{end:.3f}", ha="center", fontsize=10.5, color=INK)
-
-    ax.set_xticks(
-        range(4),
-        [
-            "PPO-MR\n(the paper's baseline)",
-            "add \u03bbs + per-turn\nformat CONTENT",
-            "move it to turn\nboundaries (Eq. 9)",
-            "MT-PPO",
-        ],
-        fontsize=9.5,
-    )
-    ax.set_ylabel("Held-out exact match", fontsize=10, color=INK_SOFT)
-    ax.set_ylim(0, 0.35)
-    ax.set_title(
-        "What the paper's +1.7-point MT-PPO gain actually contains",
-        fontsize=12.5,
-        color=INK,
-        loc="left",
-        pad=10,
-    )
-    # No footnote: the bars carry their own values, and the argument they support -- that the
-    # paper's own comparison moves content and placement together -- is the surrounding prose's
-    # job, not a caption's.
-    fig.tight_layout(rect=(0, 0.01, 1, 1))
-    fig.savefig(out, dpi=200, facecolor=SURFACE)
-    plt.close(fig)
-
-
 def _smooth(ys: list[float], window: int = 15) -> list[float]:
     """Centred rolling mean. GRPO reward is inherently noisy step-to-step; smoothing is for
     readability only and does not change the underlying values."""
@@ -259,82 +188,60 @@ def _smooth(ys: list[float], window: int = 15) -> list[float]:
     return out
 
 
-def plot_collapse(curves: dict, out: Path) -> None:
-    """The GRPO-OR collapse, and the mechanism behind it.
+def plot_collapses(curves: dict, out: Path) -> None:
+    """Both collapsed runs next to the runs that held, one panel per track.
 
-    Second panel is frac_reward_zero_std rather than grad_norm: it is bounded [0, 1], so it reads
-    directly as "what fraction of prompt-groups produced no gradient at all", where grad_norm's
-    scale is dominated by a single pre-collapse spike. grad_norm hitting exactly 0.0000 is stated
-    in the caption instead.
+    One figure rather than two: the section's claim is that exactly two of our five runs
+    collapsed, so both collapses belong in a single glance. They cannot share an axis -- the
+    tracks logged different metrics (TRL's GRPOTrainer emits per-step reward; MTPPOTrainer logs
+    per-episode format compliance), and GRPO-OR's death never shows in its answer rate anyway,
+    only in its training signal. Collapsed runs in red, survivors in gray, direct labels.
     """
-    fig, (r_ax, z_ax) = _fig(11, 4.2, ncols=2)
+    fig, (g_ax, p_ax) = _fig(11, 4.2, ncols=2)
 
-    panels = (
-        (r_ax, "reward", "Mean reward", None),
-        (z_ax, "zero_std", "Fraction of groups with zero reward variance", (0, 1.05)),
-    )
-    for ax, key, label, ylim in panels:
-        for arm, color, name in (
-            ("grpo_mr", OURS, "GRPO-MR (merged reward)"),
-            ("grpo_or", DEAD, "GRPO-OR (binary outcome only)"),
-        ):
-            xs = [p[0] for p in curves[arm][key]]
-            ys = [p[1] for p in curves[arm][key]]
-            # Smoothed only: the raw per-step series is pure noise at this density, and in the
-            # zero-variance panel it is a binary 0/1 flicker that obscures rather than informs.
-            ax.plot(xs, _smooth(ys), color=color, linewidth=2.2, label=name)
-        ax.axvline(184, color=LOSS, linewidth=1.1, linestyle="--", alpha=0.8)
-        ax.set_xlabel("Training step", fontsize=10, color=INK_SOFT)
-        ax.set_title(label, fontsize=11, color=INK, loc="left", pad=8)
+    for arm, colour in (("grpo_mr", DEAD), ("grpo_or", LOSS)):
+        xs = [p[0] for p in curves[arm]["reward"]]
+        ys = [p[1] for p in curves[arm]["reward"]]
+        g_ax.plot(xs, _smooth(ys), color=colour, linewidth=2.2)
+    g_ax.set_title("GRPO track", fontsize=11, color=INK, loc="left", pad=8)
+    g_ax.set_ylabel("mean training reward", fontsize=9.5, color=INK_SOFT)
+    g_ax.set_ylim(0, 0.78)
+    g_ax.text(300, 0.045, "GRPO-OR", fontsize=9.5, color=LOSS)
+    g_ax.text(255, 0.60, "GRPO-MR", fontsize=9.5, color=INK_SOFT)
+
+    for arm, colour in (("ppo_mr_paper", DEAD), ("mt_ppo", DEAD), ("ppo", LOSS)):
+        series = curves[arm]
+        p_ax.plot(
+            series["step"],
+            _smooth(series["format_compliance"]),
+            color=colour,
+            linewidth=2.2 if colour == LOSS else 1.8,
+        )
+    p_ax.set_title("PPO track", fontsize=11, color=INK, loc="left", pad=8)
+    p_ax.set_ylabel("share of rollouts with a parseable answer", fontsize=9.5, color=INK_SOFT)
+    p_ax.set_ylim(0, 1.05)
+    p_ax.text(145, 0.07, "PPO-OR", fontsize=9.5, color=LOSS)
+    p_ax.text(190, 0.97, "PPO-MR / MT-PPO", fontsize=9.5, color=INK_SOFT)
+
+    for ax in (g_ax, p_ax):
+        ax.set_xlabel("training step", fontsize=9.5, color=INK_SOFT)
         ax.set_xlim(0, 500)
-        if ylim:
-            ax.set_ylim(*ylim)
 
-    r_ax.set_ylim(-0.1, 1.15)
-    r_ax.annotate(
-        "step 184\nlast nonzero reward",
-        xy=(190, 0.05),
-        xytext=(250, 0.30),
-        fontsize=8.5,
-        color=LOSS,
-        arrowprops={"arrowstyle": "->", "color": LOSS, "linewidth": 1},
-    )
-    z_ax.annotate(
-        "pinned at 1.000 \u2014 every group\nscores identically, so no gradient",
-        xy=(340, 1.0),
-        xytext=(215, 0.72),
-        fontsize=8.5,
-        color=LOSS,
-        arrowprops={"arrowstyle": "->", "color": LOSS, "linewidth": 1},
-    )
-    r_ax.legend(frameon=False, fontsize=9, loc="upper left", labelcolor=INK_SOFT)
-    fig.suptitle(
-        "A binary reward can stop training permanently",
-        fontsize=12.5,
-        color=INK,
-        x=0.007,
-        ha="left",
-        y=0.99,
-    )
-    # Smoothing is the one thing a caption must disclose -- it describes the marks themselves, so
-    # nothing else on the page can tell the reader these curves are not raw. The frozen-checkpoint
-    # and never-searched evidence belongs to the prose.
-    fig.text(0.007, 0.015, "15-step rolling mean.", fontsize=8.5, color=INK_SOFT)
-    fig.tight_layout(rect=(0, 0.04, 1, 0.94))
+    fig.suptitle("Our five training runs", fontsize=12.5, color=INK, x=0.007, ha="left", y=0.99)
+    fig.tight_layout(rect=(0, 0.01, 1, 0.94))
     fig.savefig(out, dpi=200, facecolor=SURFACE)
     plt.close(fig)
 
 
-# Categorical slots for the four PPO arms. ppo is deliberately the desaturated one -- it is the
-# arm that died, and it should read as background against the three that trained.
 # Same section order as PAPER_ANCHORS, restricted to the PPO track. PPO-OR is drawn first so the
 # collapsed arm sits behind the three that trained rather than over them.
-# All four series are this repo's own runs; "PPO-MR" is our run of the paper's PPO-MR reward.
+# All series are this repo's own runs of the paper's three PPO arms. The extra `ppo_mr` control
+# run exists in the results data but is deliberately absent here: the README presents only the
+# paper's five arms (see docs/phase-7c-paper-faithful-ppo.md §15c for the control's write-up).
 PPO_ARMS = [
     ("PPO-OR", "ppo", DEAD),
     ("PPO-MR", "ppo_mr_paper", PAPER),
     ("MT-PPO", "mt_ppo", OURS),
-    ("PPO-MR + MT-PPO's terms (ours)", "ppo_mr", GAIN),
 ]
 
 
@@ -351,20 +258,7 @@ def _ppo_curve(curves: dict, key: str, title: str):
         ax.plot(series["step"], _smooth(series[key]), color=colour, linewidth=2.0, label=name)
     ax.set_xlabel("training step", fontsize=9, color=INK_SOFT)
     fig.suptitle(title, fontsize=12.5, color=INK, x=0.011, ha="left", y=0.985)
-    # Where PPO-OR's curve stops is visible in the curve itself; only the smoothing needs saying.
-    fig.text(0.011, 0.015, "15-step rolling mean.", fontsize=8.5, color=INK_SOFT)
     return fig, ax
-
-
-def plot_format(curves: dict, out: Path) -> None:
-    """PPO-OR flatlining to zero answers while the reward-shaped arms hold near 0.8."""
-    fig, ax = _ppo_curve(curves, "format_compliance", "Our PPO-OR stops producing answers at all")
-    ax.set_ylabel("share of rollouts with a parseable answer", fontsize=9, color=INK_SOFT)
-    ax.set_ylim(0, 1.02)
-    ax.legend(frameon=False, fontsize=8.5, loc="center right", labelcolor=INK_SOFT)
-    fig.tight_layout(rect=(0, 0.04, 1, 0.93))
-    fig.savefig(out, dpi=200, facecolor=SURFACE)
-    plt.close(fig)
 
 
 def plot_searches(curves: dict, out: Path) -> None:
@@ -476,12 +370,10 @@ def main() -> None:
     summary = json.loads((RESULTS / "phase7c-summary.json").read_text())
     curves = json.loads((RESULTS / "phase7c-curves.json").read_text())
     plot_vs_paper(summary, RESULTS / "phase7c_vs_paper.png")
-    plot_decomposition(summary, RESULTS / "phase7c_decomposition.png")
-    plot_collapse(curves, RESULTS / "phase7c_collapse.png")
-    plot_format(curves, RESULTS / "phase7c_format.png")
+    plot_collapses(curves, RESULTS / "phase7c_collapses.png")
     plot_searches(curves, RESULTS / "phase7c_searches.png")
     plot_followups(RESULTS / "followup_experiments_comparison.png")
-    print("wrote 6 figures to results/")
+    print("wrote 4 figures to results/")
 
 
 if __name__ == "__main__":
