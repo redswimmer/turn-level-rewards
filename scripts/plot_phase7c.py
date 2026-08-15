@@ -209,7 +209,7 @@ def plot_collapses(curves: dict, out: Path) -> None:
     g_ax.text(300, 0.045, "GRPO-OR", fontsize=9.5, color=LOSS)
     g_ax.text(255, 0.60, "GRPO-MR", fontsize=9.5, color=INK_SOFT)
 
-    for arm, colour in (("ppo_mr_paper", DEAD), ("mt_ppo", DEAD), ("ppo", LOSS)):
+    for arm, colour in (("ppo_mr_paper", OURS), ("mt_ppo", GAIN), ("ppo", LOSS)):
         series = curves[arm]
         p_ax.plot(
             series["step"],
@@ -221,13 +221,21 @@ def plot_collapses(curves: dict, out: Path) -> None:
     p_ax.set_ylabel("share of rollouts with a parseable answer", fontsize=9.5, color=INK_SOFT)
     p_ax.set_ylim(0, 1.05)
     p_ax.text(145, 0.07, "PPO-OR", fontsize=9.5, color=LOSS)
-    p_ax.text(190, 0.97, "PPO-MR / MT-PPO", fontsize=9.5, color=INK_SOFT)
+    p_ax.text(112, 0.44, "PPO-MR", fontsize=9.5, color=OURS)
+    p_ax.text(400, 0.57, "MT-PPO", fontsize=9.5, color=GAIN)
 
     for ax in (g_ax, p_ax):
         ax.set_xlabel("training step", fontsize=9.5, color=INK_SOFT)
         ax.set_xlim(0, 500)
 
-    fig.suptitle("Our five training runs", fontsize=12.5, color=INK, x=0.007, ha="left", y=0.99)
+    fig.suptitle(
+        "Training reward and answer rate (our runs)",
+        fontsize=12.5,
+        color=INK,
+        x=0.007,
+        ha="left",
+        y=0.99,
+    )
     fig.tight_layout(rect=(0, 0.01, 1, 0.94))
     fig.savefig(out, dpi=200, facecolor=SURFACE)
     plt.close(fig)
@@ -264,7 +272,7 @@ def _ppo_curve(curves: dict, key: str, title: str):
 def plot_searches(curves: dict, out: Path) -> None:
     """Searches per episode: the arm with no search penalty is not the one that runs away."""
     fig, ax = _ppo_curve(
-        curves, "mean_tool_turns", "The unpenalised arm is not the one that searches to the cap"
+        curves, "mean_tool_turns", "Searches per episode during training (our runs)"
     )
     ax.set_ylabel("searches per episode", fontsize=9, color=INK_SOFT)
     ax.set_ylim(0, 4.4)

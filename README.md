@@ -185,10 +185,14 @@ arm (0.528). Watch only the retrieval metric and the most broken arm looks like 
 by construction; after step 184 its gradient is exactly 0.0000 and never recovers. `GRPO-MR` is the
 same arm plus the retrieval bonus, and it scores 0.295.
 
-Why does scale decide it? Collapse needs a batch with zero correct answers. If one rollout is
-right with probability `p` and a batch holds `N` rollouts, that chance
-is `(1−p)^N` — a smaller model shrinks `p`, a smaller batch shrinks `N`, and ours are much smaller
-on both counts.
+Why did ours collapse when the paper's didn't? We haven't isolated that, so here is the hypothesis
+rather than a claim. Collapse needs a batch with zero correct answers: if one rollout is right
+with probability `p` and a batch holds `N` rollouts, that chance is `(1−p)^N`. Scale is the
+suspect — a smaller model shrinks `p`, a smaller batch shrinks `N`, and ours are much smaller on
+both counts (our weaker BM25 retrieval plausibly shrinks `p` further). But we never ran the
+paper's scale, so this is an inference from the mechanism, not a measured result. The test we'd
+run: retrain `GRPO-OR` with a larger rollout group — raising `N` alone — and see whether the
+collapse disappears.
 
 ### A search penalty is not what prevents runaway searching
 
