@@ -329,11 +329,12 @@ def plot_collapse(curves: dict, out: Path) -> None:
 # arm that died, and it should read as background against the three that trained.
 # Same section order as PAPER_ANCHORS, restricted to the PPO track. PPO-OR is drawn first so the
 # collapsed arm sits behind the three that trained rather than over them.
+# All four series are this repo's own runs; "PPO-MR" is our run of the paper's PPO-MR reward.
 PPO_ARMS = [
     ("PPO-OR", "ppo", DEAD),
-    ("PPO-MR (paper)", "ppo_mr_paper", PAPER),
+    ("PPO-MR", "ppo_mr_paper", PAPER),
     ("MT-PPO", "mt_ppo", OURS),
-    ("PPO-MR + content (ours)", "ppo_mr", GAIN),
+    ("PPO-MR + MT-PPO's terms (ours)", "ppo_mr", GAIN),
 ]
 
 
@@ -357,7 +358,8 @@ def _ppo_curve(curves: dict, key: str, title: str):
 
 def plot_format(curves: dict, out: Path) -> None:
     """PPO-OR flatlining to zero answers while the reward-shaped arms hold near 0.8."""
-    fig, ax = _ppo_curve(curves, "format_compliance", "PPO-OR stops answering entirely")
+    fig, ax = _ppo_curve(curves, "format_compliance", "Our PPO-OR stops producing answers at all")
+    ax.set_ylabel("share of rollouts with a parseable answer", fontsize=9, color=INK_SOFT)
     ax.set_ylim(0, 1.02)
     ax.legend(frameon=False, fontsize=8.5, loc="center right", labelcolor=INK_SOFT)
     fig.tight_layout(rect=(0, 0.04, 1, 0.93))
@@ -370,6 +372,7 @@ def plot_searches(curves: dict, out: Path) -> None:
     fig, ax = _ppo_curve(
         curves, "mean_tool_turns", "The unpenalised arm is not the one that searches to the cap"
     )
+    ax.set_ylabel("searches per episode", fontsize=9, color=INK_SOFT)
     ax.set_ylim(0, 4.4)
     # The cap is what makes "uncontrolled search" legible -- without it the reader cannot tell
     # whether 4 turns per episode is a lot.

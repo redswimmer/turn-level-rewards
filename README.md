@@ -20,7 +20,8 @@ labelled as such and kept separate from the reproduction.
 NVIDIA RTX 4090, vs. the paper's `Qwen2.5-7B` on 8 NVIDIA H100s — with a batch size 128× smaller.
 HotpotQA is one of the paper's own six evaluation datasets; this repo uses it exclusively, for
 its genuinely multi-hop questions. Retrieval is BM25 rather than the paper's dense E5. Every arm
-here is also a single run (n=1) against the paper's n=5, so seed-to-seed variance is unmeasured.
+here is also a single run (n=1); the paper averages five runs for its training curves, so
+seed-to-seed variance here is unmeasured.
 Smaller deviations are noted inline.
 
 ## The Agent
@@ -50,9 +51,9 @@ guess, get scored no differently turn-by-turn. GRPO can't isolate which turn ear
 
 That holds no matter *where* you attach a bonus. GRPO only ever sees one number per trajectory, so
 a bonus placed mid-episode still gets folded into that same number. Actually using *where* a reward
-happened requires a critic that can evaluate any point in a trajectory on its own. PPO has one;
-GRPO doesn't. That's why the later PPO approaches switch algorithms rather than just rearranging
-the reward.
+happened requires a way to value each point in a trajectory on its own. PPO's critic does exactly
+that; GRPO would need extra per-turn rollouts (the paper's `MT-GRPO`, out of scope here). That's
+why the later approaches switch to PPO rather than just rearranging the reward.
 
 Each approach below uses the paper's own reward definitions (arXiv:2505.11821 §5.2/§6.1).
 
@@ -138,77 +139,103 @@ flowchart LR
     R5b -.->|"critic sends credit<br/>backward (GAE)"| R5a
 ```
 
-> **Reward:** `R^I = 0.3·retrieval_hit + format(±0.1 / −0.2) − 0.1·n_searches` at **each turn
-> boundary**, plus `R^O` at the last token.
+> **Reward:** `R^I = 0.3·retrieval_hit + format(+0.1 / −0.2) − 0.1·(searches so far)` at **each
+> turn boundary**, plus `R^O` at the last token.
 
 Note what `R^I` contains that `PPO-MR` does not: a per-turn format term and a search-count penalty.
 
 ## Results
 
-Every arm below: same model, same scaffold, same seed, same dataset, 500 training steps (except
-`PPO-OR`, stopped once it had collapsed), evaluated on the same 7,404 held-out questions.
-Only the reward differs.
+Every arm below: same model, same scaffold, same seed, same dataset, 500 training steps,
+evaluated on the same 7,404 held-out questions. Within each algorithm's track, only the reward
+differs; across the GRPO/PPO divide the algorithm differs too, by design.
+
+| Arm | Held-out EM | What happened |
+|---|---|---|
+| `GRPO-OR` | 0.000 | Collapsed — no gradient at all after step 184 |
+| `GRPO-MR` | 0.295 | Worked |
+| `PPO-OR` | 0.002 | Collapsed — searched forever, stopped answering¹ |
+| `PPO-MR` | 0.235 | Worked |
+| `MT-PPO` | 0.274 | Worked — the paper's best method |
+| `PPO-MR` + MT-PPO's reward terms² | **0.301** | Worked — best arm overall |
+
+¹ Stopped early and evaluated at its last checkpoint before collapse.
+² Our own control arm, not in the paper — see "two effects" below.
 
 ![This reproduction against the paper's published results](results/phase7c_vs_paper.png)
 
-Our exact-match scores sit well below the paper's, and they were never going to match: this trains
-a model **8.75× smaller** on a batch **128× smaller**. The paper's own *untrained* `Qwen2.5-7B`
-scores EM 0.160–0.292 — **roughly where our best trained arm lands.** Their model starts about
-where ours finishes.
+Absolute scores were never going to match the paper's: this model is **8.75× smaller** on a batch
+**128× smaller**, and the paper's *untrained* `Qwen2.5-7B` already scores EM 0.160–0.292 — their
+model starts about where ours finishes. What is comparable is the structure: which rewards work,
+which collapse, and by how much.
 
-So absolute accuracy isn't the thing to read here. What survives the shrink is the **structure** —
-which rewards produce a working model, which kill it outright, and how large the gaps between them
-are. Everything below is about that.
+### Why our `GRPO-OR` and `PPO-OR` collapsed when the paper's didn't
 
-### A binary outcome reward killed both arms that used it
+Same reward, opposite fates — the only thing that changed is scale:
+
+| Run | Paper (Qwen2.5-7B, 8×H100) | Ours (Qwen3.5-0.8B, 1×RTX 4090) |
+|---|---|---|
+| `PPO-OR` | 0.435 EM | 0.002 EM |
+| `GRPO-OR` | 0.331 EM | 0.000 EM |
 
 ![PPO-OR's format compliance falling to zero while the reward-shaped arms hold](results/phase7c_format.png)
 
-`PPO-OR` stops answering and searches to the cap forever — while posting the **best retrieval score
-of any arm** (0.528). The headline metric points the wrong way on a completely broken model.
+`PPO-OR` stopped answering (format compliance 0.003) while posting the best retrieval score of any
+arm (0.528). Watch only the retrieval metric and the most broken arm looks like the best one.
 
 ![GRPO-OR collapsing: reward and reward-variance curves](results/phase7c_collapse.png)
 
-`GRPO-OR` died differently: once every rollout in a group scores the same, GRPO's advantage is zero
-by construction, so the gradient is **exactly 0.0000 from step 186 on** and nothing recovers.
-Adding the retrieval bonus is the whole difference between that and a working model — `GRPO-MR`
-scores 0.295 EM with nothing else changed.
+`GRPO-OR` died differently. When every rollout in a group scores the same, GRPO's advantage is zero
+by construction; after step 184 its gradient is exactly 0.0000 and never recovers. `GRPO-MR` is the
+same arm plus the retrieval bonus, and it scores 0.295.
 
-Why here and not in the paper, whose `PPO-OR` reaches 0.435: collapse needs a batch with **zero**
-correct answers, `(1−p)^N`. A smaller model lowers `p`, a smaller batch lowers `N`, and they
-compound.
+Why does scale decide it? Collapse needs a batch with zero correct answers. If one rollout is
+right with probability `p` and a batch holds `N` rollouts, that chance
+is `(1−p)^N` — a smaller model shrinks `p`, a smaller batch shrinks `N`, and ours are much smaller
+on both counts.
 
 ### A search penalty is not what prevents runaway searching
 
 ![Searches per episode: the unpenalised arm sits near 2 while the collapsed arm pins to the cap](results/phase7c_searches.png)
 
 The paper says removing its search-count penalty causes "uncontrolled search usage." `PPO-MR` runs
-that penalty at **zero** and sits near 2 searches per episode, while the arm glued to the cap is the
-collapsed one. What bounds search is the +0.2 for a wrong-but-formatted answer — always some
-pressure to stop and commit. `PPO-OR` had no such term.
+that penalty at zero and settles near 2 searches per episode. What actually bounds searching is the
++0.2 reward for a wrong-but-formatted answer — always something to gain by stopping and committing.
+`PPO-OR`, the arm with no such term, is the one that searched to the cap forever.
 
 ### The paper's headline gain is two effects, not one
 
-**The paper's headline result reproduced** — `PPO-MR → MT-PPO` gained **+0.039** EM here against
-their **+0.017**. But that step changes reward *content* and reward *placement* at once. Adding the
-missing control separates them:
+The paper's headline result reproduced: `PPO-MR → MT-PPO` is 0.235 → 0.274 EM here, a gain of
++0.039 against the paper's +0.017. But that step changes what the reward *contains* and *where* it
+is placed at once, so we added the control the paper lacks: MT-PPO's reward terms, still all placed
+at the end.
 
 ![Waterfall decomposing the MT-PPO gain into reward content and placement](results/phase7c_decomposition.png)
 
-The content is worth **+0.066**; the turn-level placement the paper's method is named for gives
-**−0.027** back. At n=1 the first is large enough to trust, the second isn't.
+The content is worth +0.066; moving it to the turns loses −0.027. At n=1 the first is large enough
+to trust, the second isn't.
 
 ### Our own experiment: a narrow reward is fragile to added penalties
 
 Separately, we stress-tested a GRPO variant using graded partial credit (F1 + exact-match bonus)
-under three added penalties.
+under added penalties (seed 123, 600 steps):
+
+| Configuration | Outcome-only EM | Merged-reward EM |
+|---|---|---|
+| Baseline | 0.242 | 0.306 |
+| + length penalty | 0.090 | 0.254 |
+| + search-count penalty³ | 0.024 | 0.220 |
+| Control: prompt change only, no penalty | 0.201 | 0.320 |
+
+³ This run also dropped the prompt's "search at most twice" instruction, since the penalty was
+meant to replace it — the control row repeats that prompt change without the penalty.
 
 ![Held-out exact match and completion length across four reward configurations](results/followup_experiments_comparison.png)
 
-No penalty beat the baseline, and the outcome-only arm answered these in **12 and 21 tokens** while
-the merged reward degraded and stayed readable. A penalty-free control ruled out the prompt change,
-so the penalty itself did it — under GRPO, a penalty with no matching positive incentive is a real
-risk, and a denser reward is only partial protection.
+Every penalty hurt. The outcome-only arm collapsed under both — its answers shrank to 12 and 21
+tokens on average — while the merged-reward arm only degraded. The control row pins the damage on
+the penalty itself, not the prompt change that accompanied it. Under GRPO, a penalty with no
+matching positive incentive is a real risk; a denser reward softens the blow but doesn't remove it.
 
 ## Future work
 
@@ -236,4 +263,4 @@ If you use this repo or build on its experiments, please cite the paper it is ba
 
 ## Contributing
 
-See `[CONTRIBUTING.md](CONTRIBUTING.md)` for dev setup, quality gates, and running tests.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, quality gates, and running tests.
