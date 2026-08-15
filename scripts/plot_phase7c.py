@@ -70,6 +70,13 @@ ARM_KEYS = {
     "GRPO-OR": "grpo_or",
     "GRPO-MR": "grpo_mr",
 }
+# Arms whose training died, so their held-out scores are not comparable measurements. GRPO-OR's
+# gradient was exactly zero from step 185 on; PPO-OR was stopped once it had stopped answering.
+# Their bars are suppressed rather than drawn: GRPO-OR still scores 0.421 on format correctness
+# (a frozen policy emits a parseable tag 42% of the time), and plotting that beside the paper's
+# 0.513 invites a comparison of two numbers that do not mean the same thing. Exact values for
+# every arm, collapsed included, are in the README's results table.
+COLLAPSED = {"PPO-OR", "GRPO-OR"}
 
 
 def plot_vs_paper(summary: dict, out: Path) -> None:
@@ -86,24 +93,22 @@ def plot_vs_paper(summary: dict, out: Path) -> None:
         ours, paper = [], []
         for arm in arms:
             m = summary[ARM_KEYS[arm]]
-            ours.append(m["em"] if idx == 0 else m["fmt"])
+            score = m["em"] if idx == 0 else m["fmt"]
+            ours.append(0.0 if arm in COLLAPSED else score)
             p = PAPER_ANCHORS[arm][idx]
             paper.append(p if p is not None else 0.0)
         ax.barh([i + 0.19 for i in y], paper, height=0.36, color=PAPER, label="Paper (Qwen2.5-7B)")
         ax.barh([i - 0.19 for i in y], ours, height=0.36, color=OURS, label="This repo (0.8B)")
         for i, arm in enumerate(arms):
-            # Coloured to the paper's series for the same reason as the "ours collapsed" label
-            # below: a neutral grey label between two bars is ambiguous about which one it means.
+            # Coloured to each series it describes: a neutral grey label sitting between two bars
+            # gives the reader no way to tell which of them it belongs to.
             if PAPER_ANCHORS[arm][idx] is None:
                 ax.text(0.008, i + 0.19, "not reported", va="center", fontsize=7.5, color=PAPER)
-            # A bar at ~0 is indistinguishable from a missing bar, so say what it means. Coloured
-            # to match our own bars, not the loss red -- red sits too close to the paper's orange
-            # and reads as labelling the paper's bar instead of the missing one.
-            if ours[i] < 0.02:
+            if arm in COLLAPSED:
                 ax.text(
                     0.012,
                     i - 0.19,
-                    "ours collapsed",
+                    "training collapsed",
                     va="center",
                     fontsize=7.5,
                     color=OURS,
