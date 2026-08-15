@@ -148,20 +148,32 @@ def plot_vs_paper(summary: dict, out: Path) -> None:
         ax.set_xlim(0, span)
         ax.set_title(title, fontsize=11, color=INK, pad=8, loc="left")
 
-    # Top-right: the bottom rows are the longest bars in both panels, and the top row's own bar is
-    # short because its collapsed partner leaves that half of the row empty.
-    em_ax.legend(frameon=False, fontsize=8.5, loc="upper right", labelcolor=INK_SOFT)
     fig.suptitle(
         "This reproduction vs. the paper's published results",
         fontsize=12.5,
         color=INK,
         x=0.007,
         ha="left",
-        y=0.99,
+        y=0.985,
+    )
+    # Figure-level and horizontal, under the title rather than inside a panel. Every corner of the
+    # exact-match axes is occupied -- bars, value labels, or the collapsed-arm notes -- so an
+    # in-axes legend has nowhere to sit without crowding something.
+    fig.legend(
+        *em_ax.get_legend_handles_labels(),
+        loc="upper left",
+        bbox_to_anchor=(0.006, 0.945),
+        ncol=2,
+        frameon=False,
+        fontsize=8.5,
+        labelcolor=INK_SOFT,
+        handlelength=1.1,
+        handleheight=0.9,
+        columnspacing=1.6,
     )
     # No footnote: the in-chart "collapsed" labels already say which arms died, and the surrounding
     # prose carries the model-size caveat. Repeating either here just competes with the bars.
-    fig.tight_layout(rect=(0, 0.01, 1, 0.95))
+    fig.tight_layout(rect=(0, 0.01, 1, 0.90))
     fig.savefig(out, dpi=200, facecolor=SURFACE)
     plt.close(fig)
 
