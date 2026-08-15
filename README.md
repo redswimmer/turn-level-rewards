@@ -216,16 +216,6 @@ risk, and a denser reward is only partial protection.
   the verifiable retrieval check used here. Not started; the paper reports no benchmark number for
   it either, so there's no published score to check against.
 
-## Running it
-
-Reproducing any of this needs a JDK and a multi-GB local Wikipedia index, since retrieval runs
-against the real ~21M-passage wiki-18 dump rather than a per-question pool.
-`scripts/setup_retrieval.sh` downloads the index and prints the server command.
-
-Training entrypoints are `turn_level_rewards.train` for the GRPO arms and `turn_level_rewards.train_ppo`
-for the PPO arms, each taking `--condition`. `scripts/plot_phase7c.py` regenerates every figure
-above from committed data alone, with no GPU and no retrieval server.
-
 ## Citation
 
 If you use this repo or build on its experiments, please cite the paper it is based on:
