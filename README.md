@@ -164,76 +164,49 @@ are. Everything below is about that.
 
 ![PPO arms during training: format compliance and searches per episode](results/phase7c_training.png)
 
-Both binary-outcome-only arms — `PPO-OR` and `GRPO-OR`, two *different algorithms* — were killed by
-the same cause, through **two different mechanisms**.
-
-`PPO-OR` is visible above: it stops answering entirely and pins itself to the 4-turn search cap.
-Scored at its last checkpoint before collapse — the paper's own methodology for its crashed
-baselines — it reaches a format compliance of **0.003** while still retrieving as well as the arms
-that worked (0.528, against 0.52 for `MT-PPO` and 0.55 for `PPO-MR`). It learned to search and
-never learned to commit. Its gradient stayed alive the whole time — `policy_loss` is nonzero in
-every one of its final 20 steps — so this is a degenerate policy, not a frozen one.
+`PPO-OR` stops answering and searches to the cap forever — while posting the **best retrieval score
+of any arm** (0.528). The headline metric points the wrong way on a completely broken model.
 
 ![GRPO-OR collapsing: reward and reward-variance curves](results/phase7c_collapse.png)
 
-`GRPO-OR` failed harder, and its mechanism is exact. Once every rollout in a group scores
-identically, GRPO's advantage — `(rᵢ − group mean) / group std` — is zero, so the gradient is
-**exactly 0.0000 from step 186 to 499**. Checkpoints 450 and 500 are byte-identical, and the frozen
-policy never called search once across all 7,404 held-out questions. Under GRPO specifically, a
-sparse binary reward isn't just slow to learn from; it's an absorbing state you cannot leave. PPO's
-critic spares it that — and still produced a model that never answers.
+`GRPO-OR` died differently: once every rollout in a group scores the same, GRPO's advantage is zero
+by construction, so the gradient is **exactly 0.0000 from step 186 on** and nothing recovers.
+Adding the retrieval bonus is the whole difference between that and a working model — `GRPO-MR`
+scores 0.295 EM with nothing else changed.
 
-Adding the retrieval bonus is the whole difference between a dead model and a working one:
-`GRPO-OR`'s **0.000** becomes `GRPO-MR`'s **0.295** EM, with nothing else changed.
-
-This is a small-scale effect, not a refutation — the paper's `PPO-OR` reaches 0.435 EM. What
-triggers it is the chance a batch contains **zero** correct answers, `(1−p)^N`: a smaller model
-lowers `p`, a smaller batch lowers `N`, and they compound in the same exponent.
+Why here and not in the paper, whose `PPO-OR` reaches 0.435: collapse needs a batch with **zero**
+correct answers, `(1−p)^N`. A smaller model lowers `p`, a smaller batch lowers `N`, and they
+compound.
 
 ### A search penalty is not what prevents runaway searching
 
-The paper warns that dropping its search-count penalty causes "uncontrolled search usage." `PPO-MR`
-runs that penalty at **zero** by the paper's own definition — and, in the right-hand panel above,
-sits near 2 searches per episode while the collapsed arm is the one glued to the cap.
-
-What actually bounds search is the **graded** outcome reward: a wrong-but-formatted answer still
-earns +0.2, so there is always positive pressure to stop searching and commit. `PPO-OR` had no such
-term, and that — not the missing penalty — is what let it search forever.
+The paper says removing its search-count penalty causes "uncontrolled search usage." `PPO-MR` runs
+that penalty at **zero** and sits near 2 searches per episode, while the arm glued to the cap is the
+collapsed one. What bounds search is the +0.2 for a wrong-but-formatted answer — always some
+pressure to stop and commit. `PPO-OR` had no such term.
 
 ### The paper's headline gain is two effects, not one
 
-**The paper's headline result reproduced**: going from `PPO-MR` to `MT-PPO` gained **+0.039 exact
-match** here, against the **+0.017** the paper reports. Right direction, larger effect.
-
-But that step changes **two things at once**: it adds reward components (a per-turn format term and
-a search penalty) *and* moves them to turn boundaries. Neither the paper's comparison nor ours can
-say which one earned the credit.
-
-Adding the missing control — the same reward content, flattened back to the final token — separates
-them:
+**The paper's headline result reproduced** — `PPO-MR → MT-PPO` gained **+0.039** EM here against
+their **+0.017**. But that step changes reward *content* and reward *placement* at once. Adding the
+missing control separates them:
 
 ![Waterfall decomposing the MT-PPO gain into reward content and placement](results/phase7c_decomposition.png)
 
-**At this scale the reward content does the work (+0.066) and turn-level placement gives some of it
-back (−0.027).** The published net gain is real, but it is a large positive plus a smaller negative,
-not a single effect. The content effect is big enough to survive a lot of seed variance; the
-placement effect is **suggestive, not settled** at n=1.
+The content is worth **+0.066**; the turn-level placement the paper's method is named for gives
+**−0.027** back. At n=1 the first is large enough to trust, the second isn't.
 
 ### Our own experiment: a narrow reward is fragile to added penalties
 
-Beyond the reproduction, we stress-tested a GRPO variant using **graded** partial credit (F1 +
-exact-match bonus) instead of the paper's binary reward, under three manufactured pressures.
+Separately, we stress-tested a GRPO variant using graded partial credit (F1 + exact-match bonus)
+under three added penalties.
 
 ![Held-out exact match and completion length across four reward configurations](results/followup_experiments_comparison.png)
 
-**None beat the baseline** — but *how* they failed is the finding. Under either penalty the
-outcome-only arm collapsed to 12- and 21-token answers, while the merged reward degraded and stayed
-coherent. A control with the same prompt change and *no* penalty held up fine, which pins the
-collapses on the penalty term itself rather than on the prompt.
-
-If every rollout in a group finds the same cheap trick, GRPO can't see past it — the whole group
-looks equally bad, so no gradient says it's wrong. A bare penalty with no matching positive
-incentive is genuinely risky under GRPO, and a denser reward is real but **incomplete** protection.
+No penalty beat the baseline, and the outcome-only arm answered these in **12 and 21 tokens** while
+the merged reward degraded and stayed readable. A penalty-free control ruled out the prompt change,
+so the penalty itself did it — under GRPO, a penalty with no matching positive incentive is a real
+risk, and a denser reward is only partial protection.
 
 ## Future work
 
