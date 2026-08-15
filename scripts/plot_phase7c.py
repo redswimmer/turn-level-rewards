@@ -200,23 +200,10 @@ def plot_decomposition(summary: dict, out: Path) -> None:
         loc="left",
         pad=10,
     )
-    fig.text(
-        0.012,
-        0.05,
-        "Net +0.039 EM, reproducing the paper's +0.017. Its own PPO-MR \u2192 MT-PPO comparison moves "
-        "reward content and placement",
-        fontsize=8.5,
-        color=INK_SOFT,
-    )
-    fig.text(
-        0.012,
-        0.015,
-        "together, so it cannot separate them. n=1 seed: the content effect is large, "
-        "the placement effect suggestive.",
-        fontsize=8.5,
-        color=INK_SOFT,
-    )
-    fig.tight_layout(rect=(0, 0.09, 1, 1))
+    # No footnote: the bars carry their own values, and the argument they support -- that the
+    # paper's own comparison moves content and placement together -- is the surrounding prose's
+    # job, not a caption's.
+    fig.tight_layout(rect=(0, 0.01, 1, 1))
     fig.savefig(out, dpi=200, facecolor=SURFACE)
     plt.close(fig)
 
@@ -288,23 +275,11 @@ def plot_collapse(curves: dict, out: Path) -> None:
         ha="left",
         y=0.99,
     )
-    fig.text(
-        0.007,
-        0.05,
-        "Same trainer, same seed, same hyperparameters \u2014 only the reward differs. After step 184, "
-        "GRPO-OR's grad_norm is exactly 0.0000 for 300 straight",
-        fontsize=8.5,
-        color=INK_SOFT,
-    )
-    fig.text(
-        0.007,
-        0.014,
-        "steps and checkpoints 450 and 500 are byte-identical. On held-out data the frozen "
-        "policy never called search once. Curves are a 15-step rolling mean.",
-        fontsize=8.5,
-        color=INK_SOFT,
-    )
-    fig.tight_layout(rect=(0, 0.09, 1, 0.94))
+    # Smoothing is the one thing a caption must disclose -- it describes the marks themselves, so
+    # nothing else on the page can tell the reader these curves are not raw. The frozen-checkpoint
+    # and never-searched evidence belongs to the prose.
+    fig.text(0.007, 0.015, "15-step rolling mean.", fontsize=8.5, color=INK_SOFT)
+    fig.tight_layout(rect=(0, 0.04, 1, 0.94))
     fig.savefig(out, dpi=200, facecolor=SURFACE)
     plt.close(fig)
 
@@ -363,15 +338,9 @@ def plot_training(curves: dict, out: Path) -> None:
         ha="left",
         y=0.99,
     )
-    fig.text(
-        0.007,
-        0.015,
-        "PPO-OR's curve ends at step 129, its last step with logged metrics before the run was "
-        "stopped. 15-step rolling mean.",
-        fontsize=8.5,
-        color=INK_SOFT,
-    )
-    fig.tight_layout(rect=(0, 0.05, 1, 0.95))
+    # Where PPO-OR's curve stops is visible in the curve itself; only the smoothing needs saying.
+    fig.text(0.007, 0.015, "15-step rolling mean.", fontsize=8.5, color=INK_SOFT)
+    fig.tight_layout(rect=(0, 0.04, 1, 0.95))
     fig.savefig(out, dpi=200, facecolor=SURFACE)
     plt.close(fig)
 
@@ -451,13 +420,15 @@ def plot_followups(out: Path) -> None:
     fig.text(
         0.007,
         0.015,
+        # Kept because it travels with the image: these bars invite comparison against the paper
+        # arms, and nothing in the chart itself says they were run under a different reward, seed
+        # and step count. What the bars already show is left to the bars.
         "Graded reward (F1 + exact-match bonus), seed 123, 600 steps — a separate track from the "
-        "paper reproduction, not comparable to it.\nOutcome-only collapses under either penalty, "
-        "answering in ~12-21 tokens; the merged reward degrades but stays coherent.",
+        "paper reproduction, not comparable to it.",
         fontsize=8.5,
         color=INK_SOFT,
     )
-    fig.tight_layout(rect=(0, 0.08, 1, 0.95))
+    fig.tight_layout(rect=(0, 0.05, 1, 0.95))
     fig.savefig(out, dpi=200, facecolor=SURFACE)
     plt.close(fig)
 
