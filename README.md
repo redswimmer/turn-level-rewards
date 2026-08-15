@@ -201,31 +201,11 @@ gets a small reward for any well-formed answer, so stopping always pays a little
 
 ### The paper's headline result reproduced
 
-`PPO-MR → MT-PPO` is 0.235 → 0.274 EM here, a gain of +0.039 against the paper's +0.017 — same
-direction, larger magnitude. Format compliance rose 0.642 → 0.830. Every arm is a single run, so
-read the direction as the reproduction and the magnitude loosely.
-
-### My own experiment: a narrow reward is fragile to added penalties
-
-Separately, I stress-tested a GRPO variant using graded partial credit (F1 + exact-match bonus)
-under added penalties (seed 123, 600 steps):
-
-| Configuration | Outcome-only EM | Merged-reward EM |
-|---|---|---|
-| Baseline | 0.242 | 0.306 |
-| + length penalty | 0.090 | 0.254 |
-| + search-count penalty³ | 0.024 | 0.220 |
-| Control: prompt change only, no penalty | 0.201 | 0.320 |
-
-³ This run also dropped the prompt's "search at most twice" instruction, since the penalty was
-meant to replace it — the control row repeats that prompt change without the penalty.
-
-![Held-out exact match and completion length across four reward configurations](results/followup_experiments_comparison.png)
-
-Every penalty hurt. The outcome-only arm collapsed under both — its answers shrank to 12 and 21
-tokens on average — while the merged-reward arm only degraded. The control row pins the damage on
-the penalty itself, not the prompt change that accompanied it. Under GRPO, a penalty with no
-matching positive incentive is a real risk; a denser reward softens the blow but doesn't remove it.
+The paper's headline is that delivering rewards at the turn that earned them beats saving them
+all for the end — `MT-PPO` beats `PPO-MR`. The same thing happened here, on a model roughly a
+tenth the size: `MT-PPO` answered more questions exactly right and followed the answer format
+more reliably (numbers in the table above). Every arm is a single run, so trust the direction
+more than the size of the gap.
 
 ## Future work
 
