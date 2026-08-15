@@ -153,11 +153,11 @@ Only the reward differs.
 
 | Arm (held-out, 7,404 questions) | Exact match | F1 | Format | Retrieval |
 | ------------------------------- | ----------- | ---- | ------ | --------- |
+| `GRPO-OR` | 0.000 | 0.015 | 0.421 | — |
+| `GRPO-MR` | **0.295** | **0.391** | **0.975** | 0.475 |
 | `PPO-OR`* | 0.002 | 0.002 | 0.003 | 0.528 |
 | `PPO-MR`  | 0.235 | 0.301 | 0.642 | **0.551** |
 | `MT-PPO`  | 0.274 | 0.362 | 0.830 | 0.521 |
-| `GRPO-OR` | 0.000 | 0.015 | 0.421 | — |
-| `GRPO-MR` | **0.295** | **0.391** | **0.975** | 0.475 |
 | `PPO-MR + content`† | **0.301** | **0.395** | 0.817 | 0.519 |
 
 `*` scored at its last checkpoint before collapse, the paper's own methodology for its crashed

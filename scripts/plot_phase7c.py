@@ -56,19 +56,21 @@ def _fig(width: float, height: float, ncols: int = 1):
 
 
 # Paper Table 2, HotpotQA. Format correctness is not reported for the two MR baselines.
+# Ordered to match the README's "Reward approaches explored" section, which builds GRPO first and
+# then switches algorithms. Both dicts drive plot order, so they must stay in step.
 PAPER_ANCHORS = {
+    "GRPO-OR": (0.331, 0.513),
+    "GRPO-MR": (0.416, None),
     "PPO-OR": (0.435, 0.916),
     "PPO-MR": (0.436, None),
     "MT-PPO": (0.453, 0.998),
-    "GRPO-OR": (0.331, 0.513),
-    "GRPO-MR": (0.416, None),
 }
 ARM_KEYS = {
+    "GRPO-OR": "grpo_or",
+    "GRPO-MR": "grpo_mr",
     "PPO-OR": "ppo-precollapse",
     "PPO-MR": "ppo_mr_paper",
     "MT-PPO": "mt_ppo",
-    "GRPO-OR": "grpo_or",
-    "GRPO-MR": "grpo_mr",
 }
 # Arms whose training died, so their held-out scores are not comparable measurements. GRPO-OR's
 # gradient was exactly zero from step 185 on; PPO-OR was stopped once it had stopped answering.
@@ -309,11 +311,13 @@ def plot_collapse(curves: dict, out: Path) -> None:
 
 # Categorical slots for the four PPO arms. ppo is deliberately the desaturated one -- it is the
 # arm that died, and it should read as background against the three that trained.
+# Same section order as PAPER_ANCHORS, restricted to the PPO track. PPO-OR is drawn first so the
+# collapsed arm sits behind the three that trained rather than over them.
 PPO_ARMS = [
-    ("MT-PPO", "mt_ppo", OURS),
-    ("PPO-MR (paper)", "ppo_mr_paper", PAPER),
-    ("PPO-MR + content (ours)", "ppo_mr", GAIN),
     ("PPO-OR", "ppo", DEAD),
+    ("PPO-MR (paper)", "ppo_mr_paper", PAPER),
+    ("MT-PPO", "mt_ppo", OURS),
+    ("PPO-MR + content (ours)", "ppo_mr", GAIN),
 ]
 
 
@@ -362,7 +366,8 @@ def plot_training(curves: dict, out: Path) -> None:
     fig.text(
         0.007,
         0.015,
-        "PPO-OR's curve ends at step 160, where it was stopped. 15-step rolling mean.",
+        "PPO-OR's curve ends at step 129, its last step with logged metrics before the run was "
+        "stopped. 15-step rolling mean.",
         fontsize=8.5,
         color=INK_SOFT,
     )
