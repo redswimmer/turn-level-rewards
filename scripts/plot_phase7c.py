@@ -112,22 +112,16 @@ def plot_vs_paper(summary: dict, out: Path) -> None:
 
     em_ax.legend(frameon=False, fontsize=8.5, loc="lower right", labelcolor=INK_SOFT)
     fig.suptitle(
-        "Reproduction vs. the paper — same reward definitions, a model 8.75x smaller",
+        "This reproduction vs. the paper's published results",
         fontsize=12.5,
         color=INK,
         x=0.007,
         ha="left",
         y=0.99,
     )
-    fig.text(
-        0.007,
-        0.015,
-        "Both binary-outcome-only arms (PPO-OR, GRPO-OR) collapsed here; the paper's did not. "
-        "Its untrained baseline scores EM 0.160-0.292 — roughly where our best trained arm lands.",
-        fontsize=8.5,
-        color=INK_SOFT,
-    )
-    fig.tight_layout(rect=(0, 0.05, 1, 0.95))
+    # No footnote: the in-chart "collapsed" labels already say which arms died, and the surrounding
+    # prose carries the model-size caveat. Repeating either here just competes with the bars.
+    fig.tight_layout(rect=(0, 0.01, 1, 0.95))
     fig.savefig(out, dpi=200, facecolor=SURFACE)
     plt.close(fig)
 
