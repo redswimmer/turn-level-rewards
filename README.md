@@ -236,29 +236,21 @@ looks equally bad, so no gradient says it's wrong. A bare penalty with no matchi
 incentive is genuinely risky under GRPO, and a denser reward is real but **incomplete** protection.
 
 <details>
-<summary>Methodology, symmetry checks and caveats</summary>
+<summary>What these results can and can't support</summary>
 
-- **Scale.** All training and evaluation ran on one RTX 4090 — roughly 14 GPU-hours of training
-  and 45 of held-out evaluation.
-- **Symmetry.** Every arm ran at seed 42 with identical hyperparameters, and no episode in any PPO
-  arm ended without a chance to answer. The arms that trained to completion took 488–495 real
-  gradient updates out of 500 steps (the rest skipped for OOM); `PPO-OR` is the exception, stopped
-  at step 159 once collapsed.
-- **Evaluation is deterministic.** Both PPO evaluations were re-run on the same checkpoints and
-  reproduced **bit-identically to 16 decimal places** (greedy decoding), so all remaining
-  uncertainty is training-run variance, not measurement error. On sampling error alone the two
-  decomposition effects are ~9 SE and ~3.7 SE — but that is the wrong error bar to lean on, which
-  is why the placement effect is not over-claimed.
-- **Seeds.** n=1 against the paper's n=5. Resolving a 1.7-point effect would need ~6–12 seeds
-  (110–220 GPU-hours).
-- **Cross-algorithm comparison is not valid here.** PPO and GRPO arms saw very different amounts of
-  data (~1,964 vs ~250 distinct training prompts) because GRPO must spend its whole generation batch
-  on one prompt to form a group baseline. The arms belong in one table; a PPO-vs-GRPO *causal*
-  claim does not follow from it.
-- **The follow-up experiments are their own track**, not comparable to the arms above: graded
-  reward, seed 123, 600 steps, with an internal baseline of 0.242 EM outcome-only vs 0.306 merged.
-- **Retrieval ceiling.** ~20% of HotpotQA's gold passage titles aren't in this Wikipedia snapshot,
-  so retrieval fraction can't reach 1.0 even with perfect search.
+- **Don't compare PPO against GRPO.** The two tracks saw very different amounts of data — ~1,964
+  vs ~250 distinct training prompts — because GRPO must spend a whole generation batch on one
+  prompt to form its group baseline. They belong on one chart; a PPO-vs-GRPO *causal* claim does
+  not follow from it.
+- **The arms within a track are genuinely matched.** Identical hyperparameters, 488–495 real
+  gradient updates out of 500 steps (the rest skipped for OOM), and no episode in any PPO arm
+  ended without a chance to answer.
+- **Differences are not measurement noise.** Both PPO evaluations were re-run on the same
+  checkpoints and reproduced bit-identically to 16 decimal places (greedy decoding), so all
+  remaining uncertainty is training-run variance. That variance is what one seed cannot estimate,
+  which is why the −0.027 placement effect is called suggestive rather than settled.
+- **Retrieval can't reach 1.0.** ~20% of HotpotQA's gold passage titles aren't in this Wikipedia
+  snapshot, so even perfect search would fall short.
 
 </details>
 
