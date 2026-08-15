@@ -13,7 +13,7 @@ holds up at a much smaller scale.
 
 Inspired by ["Reinforcing Multi-Turn Reasoning in LLM Agents via Turn-Level Reward
 Design"](https://arxiv.org/abs/2505.11821) (arXiv:2505.11821), specifically its GRPO and PPO case
-study. The reward designs below follow the paper's own definitions; experiments of our own are
+study. The reward designs below follow the paper's own definitions; experiments of my own are
 labelled as such and kept separate from the reproduction.
 
 **Biggest deviation**: a much smaller model on a single consumer GPU — `Qwen3.5-0.8B` on one
@@ -164,35 +164,31 @@ differs; across the GRPO/PPO divide the algorithm differs too, by design.
 
 Absolute scores were never going to match the paper's: this model is **8.75× smaller** on a batch
 **128× smaller**, and the paper's *untrained* `Qwen2.5-7B` already scores EM 0.160–0.292 — their
-model starts about where ours finishes. What is comparable is the structure: which rewards work,
+model starts about where mine finishes. What is comparable is the structure: which rewards work,
 which collapse, and by how much.
 
-### Why our `GRPO-OR` and `PPO-OR` collapsed when the paper's didn't
+### Why my `GRPO-OR` and `PPO-OR` collapsed when the paper's didn't
 
 Same reward, opposite fates — the only thing that changed is scale:
 
-| Run | Paper (Qwen2.5-7B, 8×H100) | Ours (Qwen3.5-0.8B, 1×RTX 4090) |
+| Run | Paper (Qwen2.5-7B, 8×H100) | Mine (Qwen3.5-0.8B, 1×RTX 4090) |
 |---|---|---|
 | `PPO-OR` | 0.435 EM | 0.002 EM |
 | `GRPO-OR` | 0.331 EM | 0.000 EM |
 
-![Both collapses during training, next to our runs that held](results/phase7c_collapses.png)
+![Both collapses during training, next to my runs that held](results/phase7c_collapses.png)
 
-`PPO-OR` stopped answering (format compliance 0.003) while posting the best retrieval score of any
-arm (0.528). Watch only the retrieval metric and the most broken arm looks like the best one.
+`PPO-OR` stopped answering while posting the best retrieval score of any arm. Watch only the
+retrieval metric and the most broken arm looks like the best one.
 
-`GRPO-OR` died differently. When every rollout in a group scores the same, GRPO's advantage is zero
-by construction; after step 184 its gradient is exactly 0.0000 and never recovers. `GRPO-MR` is the
-same arm plus the retrieval bonus, and it scores 0.295.
+`GRPO-OR` died differently: once every rollout in a group scores the same, GRPO's advantage is
+zero and the gradient goes to zero for good. `GRPO-MR` is the same arm plus the retrieval bonus,
+and it trained fine.
 
-Why did ours collapse when the paper's didn't? We haven't isolated that, so here is the hypothesis
-rather than a claim. Collapse needs a batch with zero correct answers: if one rollout is right
-with probability `p` and a batch holds `N` rollouts, that chance is `(1−p)^N`. Scale is the
-suspect — a smaller model shrinks `p`, a smaller batch shrinks `N`, and ours are much smaller on
-both counts (our weaker BM25 retrieval plausibly shrinks `p` further). But we never ran the
-paper's scale, so this is an inference from the mechanism, not a measured result. The test we'd
-run: retrain `GRPO-OR` with a larger rollout group — raising `N` alone — and see whether the
-collapse disappears.
+Why mine and not the paper's? My best guess is scale. Collapse starts with a batch that has zero
+correct answers, which gets more likely as the model gets weaker and the batch gets smaller —
+mine is much smaller on both. Unverified: I never ran the paper's scale. The test: step up
+through the model family (Qwen3.5 ships 2B and 4B) and see where the collapse stops.
 
 ### A search penalty is not what prevents runaway searching
 
@@ -209,9 +205,9 @@ that penalty at zero and settles near 2 searches per episode. What actually boun
 direction, larger magnitude. Format compliance rose 0.642 → 0.830. Every arm is a single run, so
 read the direction as the reproduction and the magnitude loosely.
 
-### Our own experiment: a narrow reward is fragile to added penalties
+### My own experiment: a narrow reward is fragile to added penalties
 
-Separately, we stress-tested a GRPO variant using graded partial credit (F1 + exact-match bonus)
+Separately, I stress-tested a GRPO variant using graded partial credit (F1 + exact-match bonus)
 under added penalties (seed 123, 600 steps):
 
 | Configuration | Outcome-only EM | Merged-reward EM |

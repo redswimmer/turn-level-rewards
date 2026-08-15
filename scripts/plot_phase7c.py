@@ -92,7 +92,7 @@ def plot_vs_paper(summary: dict, out: Path) -> None:
     y = range(len(arms))
     fig, (em_ax, fmt_ax) = _fig(11, 4.2, ncols=2)
 
-    for ax, idx, title in ((em_ax, 0, "Exact match"), (fmt_ax, 1, "Format correctness")):
+    for ax, idx, title in ((em_ax, 0, "Exact Match"), (fmt_ax, 1, "Format Correctness")):
         ours, paper = [], []
         for arm in arms:
             m = summary[ARM_KEYS[arm]]
@@ -146,7 +146,7 @@ def plot_vs_paper(summary: dict, out: Path) -> None:
         ax.set_yticks(list(y), arms, fontsize=9.5)
         ax.invert_yaxis()
         ax.set_xlim(0, span)
-        ax.set_title(title, fontsize=11, color=INK, pad=8, loc="left")
+        ax.set_title(title, fontsize=11.5, color=INK, weight="bold", pad=8)
 
     fig.suptitle(
         "This reproduction vs. the paper's published results",
@@ -203,8 +203,10 @@ def plot_collapses(curves: dict, out: Path) -> None:
         xs = [p[0] for p in curves[arm]["reward"]]
         ys = [p[1] for p in curves[arm]["reward"]]
         g_ax.plot(xs, _smooth(ys), color=colour, linewidth=2.2)
-    g_ax.set_title("GRPO track", fontsize=11, color=INK, loc="left", pad=8)
-    g_ax.set_ylabel("mean training reward", fontsize=9.5, color=INK_SOFT)
+    g_ax.set_title(
+        "Training Reward (GRPO, this repo)", fontsize=11.5, color=INK, weight="bold", pad=8
+    )
+    g_ax.set_ylabel("Reward", fontsize=10, color=INK_SOFT)
     g_ax.set_ylim(0, 0.78)
     g_ax.text(300, 0.045, "GRPO-OR", fontsize=9.5, color=LOSS)
     g_ax.text(255, 0.60, "GRPO-MR", fontsize=9.5, color=INK_SOFT)
@@ -217,26 +219,20 @@ def plot_collapses(curves: dict, out: Path) -> None:
             color=colour,
             linewidth=2.2 if colour == LOSS else 1.8,
         )
-    p_ax.set_title("PPO track", fontsize=11, color=INK, loc="left", pad=8)
-    p_ax.set_ylabel("share of rollouts with a parseable answer", fontsize=9.5, color=INK_SOFT)
+    p_ax.set_title(
+        "Format Correctness (PPO, this repo)", fontsize=11.5, color=INK, weight="bold", pad=8
+    )
+    p_ax.set_ylabel("Format Correctness", fontsize=10, color=INK_SOFT)
     p_ax.set_ylim(0, 1.05)
     p_ax.text(145, 0.07, "PPO-OR", fontsize=9.5, color=LOSS)
     p_ax.text(112, 0.44, "PPO-MR", fontsize=9.5, color=OURS)
     p_ax.text(400, 0.57, "MT-PPO", fontsize=9.5, color=GAIN)
 
     for ax in (g_ax, p_ax):
-        ax.set_xlabel("training step", fontsize=9.5, color=INK_SOFT)
+        ax.set_xlabel("Step", fontsize=10, color=INK_SOFT)
         ax.set_xlim(0, 500)
 
-    fig.suptitle(
-        "Training reward and answer rate (our runs)",
-        fontsize=12.5,
-        color=INK,
-        x=0.007,
-        ha="left",
-        y=0.99,
-    )
-    fig.tight_layout(rect=(0, 0.01, 1, 0.94))
+    fig.tight_layout(rect=(0, 0.01, 1, 1))
     fig.savefig(out, dpi=200, facecolor=SURFACE)
     plt.close(fig)
 
@@ -264,24 +260,22 @@ def _ppo_curve(curves: dict, key: str, title: str):
     for name, arm, colour in PPO_ARMS:
         series = curves[arm]
         ax.plot(series["step"], _smooth(series[key]), color=colour, linewidth=2.0, label=name)
-    ax.set_xlabel("training step", fontsize=9, color=INK_SOFT)
-    fig.suptitle(title, fontsize=12.5, color=INK, x=0.011, ha="left", y=0.985)
+    ax.set_xlabel("Step", fontsize=10, color=INK_SOFT)
+    ax.set_title(title, fontsize=11.5, color=INK, weight="bold", pad=8)
     return fig, ax
 
 
 def plot_searches(curves: dict, out: Path) -> None:
     """Searches per episode: the arm with no search penalty is not the one that runs away."""
-    fig, ax = _ppo_curve(
-        curves, "mean_tool_turns", "Searches per episode during training (our runs)"
-    )
-    ax.set_ylabel("searches per episode", fontsize=9, color=INK_SOFT)
+    fig, ax = _ppo_curve(curves, "mean_tool_turns", "Searches per Episode (PPO, this repo)")
+    ax.set_ylabel("Searches per Episode", fontsize=10, color=INK_SOFT)
     ax.set_ylim(0, 4.4)
     # The cap is what makes "uncontrolled search" legible -- without it the reader cannot tell
     # whether 4 turns per episode is a lot.
     ax.axhline(4, color=LOSS, linewidth=1.0, linestyle="--")
     ax.text(20, 3.82, "4-turn cap", fontsize=8, color=LOSS, va="top")
     ax.legend(frameon=False, fontsize=8.5, loc="lower right", labelcolor=INK_SOFT)
-    fig.tight_layout(rect=(0, 0.04, 1, 0.93))
+    fig.tight_layout(rect=(0, 0.01, 1, 1))
     fig.savefig(out, dpi=200, facecolor=SURFACE)
     plt.close(fig)
 
@@ -313,8 +307,8 @@ def plot_followups(out: Path) -> None:
     fig, (em_ax, len_ax) = _fig(11, 4.2, ncols=2)
 
     for ax, key, title in (
-        (em_ax, "eval_exact_match", "Held-out exact match"),
-        (len_ax, "eval_completions/mean_length", "Mean completion length (tokens)"),
+        (em_ax, "eval_exact_match", "Held-out Exact Match (this repo)"),
+        (len_ax, "eval_completions/mean_length", "Mean Completion Length (tokens, this repo)"),
     ):
         for offset, (condition, colour, label) in enumerate(
             (("outcome_only", PAPER, "Outcome only"), ("turn_level", OURS, "Merged reward"))
@@ -338,7 +332,7 @@ def plot_followups(out: Path) -> None:
                     color=INK_SOFT,
                 )
         ax.set_xticks(list(x), labels, fontsize=8.5)
-        ax.set_title(title, fontsize=11, color=INK, pad=8, loc="left")
+        ax.set_title(title, fontsize=11.5, color=INK, weight="bold", pad=8)
         ax.grid(axis="x", visible=False)
         # Headroom for the value labels, and for the legend that sits over the left panel.
         ax.set_ylim(0, max(m[key] for r in runs.values() for m in r) * 1.22)
@@ -351,7 +345,7 @@ def plot_followups(out: Path) -> None:
     em_ax.legend(frameon=False, fontsize=8.5, loc="upper left", labelcolor=INK_SOFT)
 
     fig.suptitle(
-        "Our own experiments: none of three added pressures beat the baseline",
+        "My graded-reward GRPO experiments",
         fontsize=12.5,
         color=INK,
         x=0.007,
