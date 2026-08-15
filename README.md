@@ -239,18 +239,6 @@ If every rollout in a group finds the same cheap trick, GRPO can't see past it �
 looks equally bad, so no gradient says it's wrong. A bare penalty with no matching positive
 incentive is genuinely risky under GRPO, and a denser reward is real but **incomplete** protection.
 
-### What went wrong first
-
-The decomposition above exists by accident. `PPO-MR + content` was built as a "cleaner" PPO-MR
-before the paper's actual definition was checked — and measured against *that*, the paper's central
-claim appeared **not** to reproduce. It does. Our own deviation was hiding it, and the error only
-surfaced when the results were written up and the paper re-read.
-
-The accidental arm turned out to be the useful one, but the lesson runs the other way: reproduce
-faithfully first, then improve. A baseline you designed yourself cannot tell you whether someone
-else's result holds.
-
-
 ## Future work
 
 - **LLM-as-judge reward.** The paper's other turn-level signal — a model scores the turn instead of
