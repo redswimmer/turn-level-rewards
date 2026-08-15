@@ -54,12 +54,9 @@ happened requires a critic that can evaluate any point in a trajectory on its ow
 GRPO doesn't. That's why the later PPO approaches switch algorithms rather than just rearranging
 the reward.
 
-Each approach below uses the paper's own reward definitions (arXiv:2505.11821 §5.2/§6.1); each
-section states its exact reward.
+Each approach below uses the paper's own reward definitions (arXiv:2505.11821 §5.2/§6.1).
 
 ### 1. `GRPO-OR` — outcome only
-
-Reward = final-answer correctness, nothing else. Search behavior gets no direct signal at all.
 
 ```mermaid
 flowchart LR
@@ -73,9 +70,6 @@ flowchart LR
 > **Reward:** `R = 1.0 if exact_match else 0.0` — binary, terminal, nothing for search.
 
 ### 2. `GRPO-MR` — merged reward
-
-Adds a bonus for surfacing a real supporting passage, but folds it into the *same* single
-trajectory-level number. Denser signal; the advantage is still spread uniformly across every token.
 
 ```mermaid
 flowchart LR
@@ -112,9 +106,8 @@ flowchart LR
 
 ### 4. `PPO-MR` — merged reward, with a critic
 
-The paper's PPO baseline. Adds retrieval correctness, but still sums everything into the final
-token — the critic spreads it backward, but the reward itself says nothing about *when* it was
-earned.
+The paper's PPO baseline. The critic spreads credit backward, but the reward itself says nothing
+about *when* it was earned.
 
 ```mermaid
 flowchart LR
@@ -131,8 +124,8 @@ flowchart LR
 
 ### 5. `MT-PPO` — turn-level credit assignment
 
-The paper's best method. Same components, but each turn's reward is placed **at the turn that
-earned it**, so the critic's value estimate differs turn-by-turn.
+The paper's best method. Placing each turn's reward **at the turn that earned it** is what makes
+the critic's value estimate differ turn-by-turn.
 
 ```mermaid
 flowchart LR
@@ -149,8 +142,6 @@ flowchart LR
 > boundary**, plus `R^O` at the last token.
 
 Note what `R^I` contains that `PPO-MR` does not: a per-turn format term and a search-count penalty.
-Those are MT-PPO's own contribution, not baseline components — which turns out to matter a lot
-(see [the decomposition below](#the-papers-headline-gain-is-two-effects-not-one)).
 
 ## Results
 
