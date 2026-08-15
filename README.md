@@ -160,11 +160,6 @@ roughly where this repo's best *trained* arm lands.
 `PPO-OR` is scored at its last checkpoint before collapse, the paper's own methodology for its
 crashed baselines.
 
-### Turn-level reward reproduces, and the effect is larger here
-
-`PPO-MR → MT-PPO` gains **+0.039 exact match** against the paper's +0.017. On the GRPO side the
-merged reward is the difference between a working model and a dead one: **0.000 → 0.295** EM.
-
 ### A binary outcome reward killed both arms that used it
 
 ![PPO arms during training: format compliance and searches per episode](results/phase7c_training.png)
@@ -188,6 +183,9 @@ policy never called search once across all 7,404 held-out questions. Under GRPO 
 sparse binary reward isn't just slow to learn from; it's an absorbing state you cannot leave. PPO's
 critic spares it that — and still produced a model that never answers.
 
+Adding the retrieval bonus is the whole difference between a dead model and a working one:
+`GRPO-OR`'s **0.000** becomes `GRPO-MR`'s **0.295** EM, with nothing else changed.
+
 This is a small-scale effect, not a refutation — the paper's `PPO-OR` reaches 0.435 EM. What
 triggers it is the chance a batch contains **zero** correct answers, `(1−p)^N`: a smaller model
 lowers `p`, a smaller batch lowers `N`, and they compound in the same exponent.
@@ -204,9 +202,12 @@ term, and that — not the missing penalty — is what let it search forever.
 
 ### The paper's headline gain is two effects, not one
 
-The paper's `PPO-MR → MT-PPO` step changes **two things at once**: it adds reward components (a
-per-turn format term and a search penalty) *and* moves them to turn boundaries. Its published gain
-cannot say which one earned the credit.
+**The paper's headline result reproduced**: going from `PPO-MR` to `MT-PPO` gained **+0.039 exact
+match** here, against the **+0.017** the paper reports. Right direction, larger effect.
+
+But that step changes **two things at once**: it adds reward components (a per-turn format term and
+a search penalty) *and* moves them to turn boundaries. Neither the paper's comparison nor ours can
+say which one earned the credit.
 
 Adding the missing control — the same reward content, flattened back to the final token — separates
 them:
