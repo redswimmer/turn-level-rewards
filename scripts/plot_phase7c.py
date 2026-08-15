@@ -76,8 +76,9 @@ ARM_KEYS = {
 # gradient was exactly zero from step 185 on; PPO-OR was stopped once it had stopped answering.
 # Their bars are suppressed rather than drawn: GRPO-OR still scores 0.421 on format correctness
 # (a frozen policy emits a parseable tag 42% of the time), and plotting that beside the paper's
-# 0.513 invites a comparison of two numbers that do not mean the same thing. Exact values for
-# every arm, collapsed included, are in the README's results table.
+# 0.513 invites a comparison of two numbers that do not mean the same thing. Suppressing them is
+# also why every surviving bar is value-labelled below -- this figure replaces the results table
+# it used to sit above, so it has to carry the exact numbers itself.
 COLLAPSED = {"PPO-OR", "GRPO-OR"}
 
 
@@ -105,14 +106,19 @@ def plot_vs_paper(summary: dict, out: Path) -> None:
         ax.barh(
             [i - 0.19 for i in y], ours, height=0.36, color=OURS, label="This repo (Qwen3.5-0.8B)"
         )
+        # Each panel gets its own x-range. They measure different things, and a shared axis would
+        # squeeze every exact-match bar into the left third to accommodate format's near-1.0 bars.
+        span = max(max(ours), max(paper)) * 1.12
         for i, arm in enumerate(arms):
             # Coloured to each series it describes: a neutral grey label sitting between two bars
             # gives the reader no way to tell which of them it belongs to.
             if PAPER_ANCHORS[arm][idx] is None:
-                ax.text(0.008, i + 0.19, "not reported", va="center", fontsize=7.5, color=PAPER)
+                ax.text(
+                    0.008 * span, i + 0.19, "not reported", va="center", fontsize=7.5, color=PAPER
+                )
             if arm in COLLAPSED:
                 ax.text(
-                    0.012,
+                    0.012 * span,
                     i - 0.19,
                     "training collapsed",
                     va="center",
@@ -120,12 +126,31 @@ def plot_vs_paper(summary: dict, out: Path) -> None:
                     color=OURS,
                     weight="bold",
                 )
+            # Print the value on every bar that exists, so the figure carries the exact numbers
+            # and needs no results table beside it. Long bars take the label inside in the surface
+            # colour; short ones would not fit, so those sit just past the end.
+            for value, offset, colour in ((paper[i], 0.19, PAPER), (ours[i], -0.19, OURS)):
+                if value <= 0:
+                    continue
+                inside = value > 0.3 * span
+                ax.text(
+                    value - 0.015 * span if inside else value + 0.012 * span,
+                    i + offset,
+                    f"{value:.3f}",
+                    va="center",
+                    ha="right" if inside else "left",
+                    fontsize=8,
+                    color=SURFACE if inside else colour,
+                    weight="bold",
+                )
         ax.set_yticks(list(y), arms, fontsize=9.5)
         ax.invert_yaxis()
-        ax.set_xlim(0, 1.05)
+        ax.set_xlim(0, span)
         ax.set_title(title, fontsize=11, color=INK, pad=8, loc="left")
 
-    em_ax.legend(frameon=False, fontsize=8.5, loc="lower right", labelcolor=INK_SOFT)
+    # Top-right: the bottom rows are the longest bars in both panels, and the top row's own bar is
+    # short because its collapsed partner leaves that half of the row empty.
+    em_ax.legend(frameon=False, fontsize=8.5, loc="upper right", labelcolor=INK_SOFT)
     fig.suptitle(
         "This reproduction vs. the paper's published results",
         fontsize=12.5,

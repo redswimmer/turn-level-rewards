@@ -151,25 +151,14 @@ Only the reward differs.
 
 ![This reproduction against the paper's published results](results/phase7c_vs_paper.png)
 
-| Arm (held-out, 7,404 questions) | Exact match | F1 | Format | Retrieval |
-| ------------------------------- | ----------- | ---- | ------ | --------- |
-| `GRPO-OR` | 0.000 | 0.015 | 0.421 | — |
-| `GRPO-MR` | **0.295** | **0.391** | **0.975** | 0.475 |
-| `PPO-OR`* | 0.002 | 0.002 | 0.003 | 0.528 |
-| `PPO-MR`  | 0.235 | 0.301 | 0.642 | **0.551** |
-| `MT-PPO`  | 0.274 | 0.362 | 0.830 | 0.521 |
-| `PPO-MR + content`† | **0.301** | **0.395** | 0.817 | 0.519 |
-
-`*` scored at its last checkpoint before collapse, the paper's own methodology for its crashed
-baselines. `GRPO-OR`'s reward is never given retrieval state, so that metric isn't logged for it.
-`†` not a paper arm — our own control, used in [the decomposition
-below](#the-papers-headline-gain-is-two-effects-not-one).
-
-**Format correctness tracks the paper closely; exact match sits systematically below it** — the
+**Exact match lands systematically below the paper's; format correctness lands much nearer** — the
 signature of training a model **8.75× smaller** (`Qwen3.5-0.8B` vs `Qwen2.5-7B`). Format is dense
 and saturates quickly; exact match is sparse and hard, and is what the paper's larger model and
 128× larger batch actually buy. For scale, the paper's *untrained* baseline scores EM 0.160–0.292 —
 roughly where this repo's best *trained* arm lands.
+
+`PPO-OR` is scored at its last checkpoint before collapse, the paper's own methodology for its
+crashed baselines.
 
 ### Turn-level reward reproduces, and the effect is larger here
 
@@ -184,8 +173,9 @@ Both binary-outcome-only arms — `PPO-OR` and `GRPO-OR`, two *different algorit
 the same cause, through **two different mechanisms**.
 
 `PPO-OR` is visible above: it stops answering entirely and pins itself to the 4-turn search cap,
-ending at a format compliance of **0.003** while still retrieving as well as the arms that work
-(0.528). It learned to search and never learned to commit. Its gradient stayed alive the whole
+ending at a format compliance of **0.003** while still retrieving as well as the arms that worked
+(0.528, against 0.52 for `MT-PPO` and 0.55 for `PPO-MR`). It learned to search and never learned to
+commit. Its gradient stayed alive the whole
 time — `policy_loss` is nonzero in every one of its final 20 steps — so this is a degenerate policy,
 not a frozen one.
 
