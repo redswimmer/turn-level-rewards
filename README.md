@@ -151,14 +151,14 @@ Only the reward differs.
 
 ![This reproduction against the paper's published results](results/phase7c_vs_paper.png)
 
-**Exact match lands systematically below the paper's; format correctness lands much nearer** — the
-signature of training a model **8.75× smaller** (`Qwen3.5-0.8B` vs `Qwen2.5-7B`). Format is dense
-and saturates quickly; exact match is sparse and hard, and is what the paper's larger model and
-128× larger batch actually buy. For scale, the paper's *untrained* baseline scores EM 0.160–0.292 —
-roughly where this repo's best *trained* arm lands.
+Our exact-match scores sit well below the paper's, and they were never going to match: this trains
+a model **8.75× smaller** on a batch **128× smaller**. The paper's own *untrained* `Qwen2.5-7B`
+scores EM 0.160–0.292 — **roughly where our best trained arm lands.** Their model starts about
+where ours finishes.
 
-`PPO-OR` is scored at its last checkpoint before collapse, the paper's own methodology for its
-crashed baselines.
+So absolute accuracy isn't the thing to read here. What survives the shrink is the **structure** —
+which rewards produce a working model, which kill it outright, and how large the gaps between them
+are. Everything below is about that.
 
 ### A binary outcome reward killed both arms that used it
 
@@ -167,12 +167,12 @@ crashed baselines.
 Both binary-outcome-only arms — `PPO-OR` and `GRPO-OR`, two *different algorithms* — were killed by
 the same cause, through **two different mechanisms**.
 
-`PPO-OR` is visible above: it stops answering entirely and pins itself to the 4-turn search cap,
-ending at a format compliance of **0.003** while still retrieving as well as the arms that worked
-(0.528, against 0.52 for `MT-PPO` and 0.55 for `PPO-MR`). It learned to search and never learned to
-commit. Its gradient stayed alive the whole
-time — `policy_loss` is nonzero in every one of its final 20 steps — so this is a degenerate policy,
-not a frozen one.
+`PPO-OR` is visible above: it stops answering entirely and pins itself to the 4-turn search cap.
+Scored at its last checkpoint before collapse — the paper's own methodology for its crashed
+baselines — it reaches a format compliance of **0.003** while still retrieving as well as the arms
+that worked (0.528, against 0.52 for `MT-PPO` and 0.55 for `PPO-MR`). It learned to search and
+never learned to commit. Its gradient stayed alive the whole time — `policy_loss` is nonzero in
+every one of its final 20 steps — so this is a degenerate policy, not a frozen one.
 
 ![GRPO-OR collapsing: reward and reward-variance curves](results/phase7c_collapse.png)
 
