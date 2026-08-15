@@ -241,90 +241,15 @@ incentive is genuinely risky under GRPO, and a denser reward is real but **incom
   the verifiable retrieval check used here. Not started; the paper reports no benchmark number for
   it either, so there's no published score to check against.
 
-## Project structure
+## Running it
 
-```
-.
-├── data/       # downloaded wiki-18 retrieval corpus + BM25 index (gitignored, multi-GB)
-├── docs/       # phase docs, design specs, roadmap
-├── outputs/    # training checkpoints + logs per condition (gitignored)
-├── results/    # final held-out metrics + comparison plots (committed)
-├── scripts/    # retrieval server, setup/verification, plotting (plot_phase7c.py regenerates
-│              #   every README figure from committed data alone)
-├── src/        # the turn_level_rewards package (env, rewards, metrics, data, train, evaluate)
-└── tests/      # unit tests (fast, no GPU, no live retrieval server)
-```
+Reproducing any of this needs a JDK and a multi-GB local Wikipedia index, since retrieval runs
+against the real ~21M-passage wiki-18 dump rather than a per-question pool.
+`scripts/setup_retrieval.sh` downloads the index and prints the server command.
 
-
-
-## Getting started
-
-
-
-### Prerequisites
-
-- Python 3.13+
-- `[uv](https://docs.astral.sh/uv/)`
-- JDK 21 (needed by the retrieval server's Lucene bridge)
-
-Two choices worth knowing before you set up: the model is a deliberately small `Qwen3.5-0.8B`
-(fits one GPU, no distributed training), and retrieval hits a real ~21M-passage Wikipedia
-snapshot rather than a small per-question pool (a closed pool would make retrieval trivially
-easy to solve, not a real test).
-
-```bash
-uv sync
-sudo apt install openjdk-21-jdk
-```
-
-
-
-### Retrieval server
-
-Training and evaluation search a local BM25 server backed by the real wiki-18
-Wikipedia dump (~21M passages). Set it up once:
-
-```bash
-bash scripts/setup_retrieval.sh   # downloads the wiki-18 BM25 index (+corpus if needed) into data/wiki18/
-```
-
-The script downloads the index, checks whether it also needs the separate
-corpus file, and prints the exact command to launch the server, something
-like:
-
-```bash
-uv run python scripts/retrieval_server.py \
-    --index_path data/wiki18/bm25-repo/bm25 \
-    --corpus_path data/wiki18/data00/jiajie_jin/flashrag_indexes/wiki_dpr_100w/wiki_dump.jsonl \
-    --port 8000
-```
-
-Run that (in the background or a separate terminal, since it needs to stay up for
-the rest of setup and for training/evaluation later), then confirm it's
-working:
-
-```bash
-uv run python scripts/verify_retrieval.py
-```
-
-```
-PASS: retrieval server is up, wired correctly, and returns real documents.
-```
-
-
-
-### Training
-
-```bash
-uv run python -m turn_level_rewards.train --condition outcome_only
-uv run python -m turn_level_rewards.train --condition turn_level
-```
-
-The bare invocation above (no extra flags) runs at smoke-test scale: 8 rows, 2 steps, a real
-`Qwen/Qwen3.5-0.8B` model against the retrieval server started above. Pass `--train-size`,
-`--max-steps`, `--num-generations`, etc. explicitly for a full-scale run. Both conditions
-log to the same [trackio](https://github.com/gradio-app/trackio) project
-(`turn-level-rewards`). Run `trackio show --project turn-level-rewards` to view.
+Training entrypoints are `turn_level_rewards.train` for the GRPO arms and `turn_level_rewards.train_ppo`
+for the PPO arms, each taking `--condition`. `scripts/plot_phase7c.py` regenerates every figure
+above from committed data alone, with no GPU and no retrieval server.
 
 ## Citation
 
