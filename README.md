@@ -149,10 +149,6 @@ Every arm below: same model, same scaffold, same seed, same dataset, 500 trainin
 `PPO-OR`, stopped once it had collapsed), evaluated on the same 7,404 held-out questions.
 Only the reward differs.
 
-Compare arms *within* an algorithm, not across one. GRPO has to spend a whole generation batch on
-a single prompt to form its group baseline, so its arms saw ~250 distinct training prompts against
-PPO's ~1,964 — they belong on one chart, but PPO-vs-GRPO isn't a fair fight.
-
 ![This reproduction against the paper's published results](results/phase7c_vs_paper.png)
 
 **Exact match lands systematically below the paper's; format correctness lands much nearer** — the
