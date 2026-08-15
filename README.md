@@ -149,6 +149,10 @@ Every arm below: same model, same scaffold, same seed, same dataset, 500 trainin
 `PPO-OR`, stopped once it had collapsed), evaluated on the same 7,404 held-out questions.
 Only the reward differs.
 
+Compare arms *within* an algorithm, not across one. GRPO has to spend a whole generation batch on
+a single prompt to form its group baseline, so its arms saw ~250 distinct training prompts against
+PPO's ~1,964 — they belong on one chart, but PPO-vs-GRPO isn't a fair fight.
+
 ![This reproduction against the paper's published results](results/phase7c_vs_paper.png)
 
 **Exact match lands systematically below the paper's; format correctness lands much nearer** — the
@@ -234,25 +238,6 @@ collapses on the penalty term itself rather than on the prompt.
 If every rollout in a group finds the same cheap trick, GRPO can't see past it — the whole group
 looks equally bad, so no gradient says it's wrong. A bare penalty with no matching positive
 incentive is genuinely risky under GRPO, and a denser reward is real but **incomplete** protection.
-
-<details>
-<summary>What these results can and can't support</summary>
-
-- **Don't compare PPO against GRPO.** The two tracks saw very different amounts of data — ~1,964
-  vs ~250 distinct training prompts — because GRPO must spend a whole generation batch on one
-  prompt to form its group baseline. They belong on one chart; a PPO-vs-GRPO *causal* claim does
-  not follow from it.
-- **The arms within a track are genuinely matched.** Identical hyperparameters, 488–495 real
-  gradient updates out of 500 steps (the rest skipped for OOM), and no episode in any PPO arm
-  ended without a chance to answer.
-- **Differences are not measurement noise.** Both PPO evaluations were re-run on the same
-  checkpoints and reproduced bit-identically to 16 decimal places (greedy decoding), so all
-  remaining uncertainty is training-run variance. That variance is what one seed cannot estimate,
-  which is why the −0.027 placement effect is called suggestive rather than settled.
-- **Retrieval can't reach 1.0.** ~20% of HotpotQA's gold passage titles aren't in this Wikipedia
-  snapshot, so even perfect search would fall short.
-
-</details>
 
 ### What went wrong first
 
