@@ -162,7 +162,7 @@ are. Everything below is about that.
 
 ### A binary outcome reward killed both arms that used it
 
-![PPO arms during training: format compliance and searches per episode](results/phase7c_training.png)
+![PPO-OR's format compliance falling to zero while the reward-shaped arms hold](results/phase7c_format.png)
 
 `PPO-OR` stops answering and searches to the cap forever — while posting the **best retrieval score
 of any arm** (0.528). The headline metric points the wrong way on a completely broken model.
@@ -179,6 +179,8 @@ correct answers, `(1−p)^N`. A smaller model lowers `p`, a smaller batch lowers
 compound.
 
 ### A search penalty is not what prevents runaway searching
+
+![Searches per episode: the unpenalised arm sits near 2 while the collapsed arm pins to the cap](results/phase7c_searches.png)
 
 The paper says removing its search-count penalty causes "uncontrolled search usage." `PPO-MR` runs
 that penalty at **zero** and sits near 2 searches per episode, while the arm glued to the cap is the

@@ -337,51 +337,46 @@ PPO_ARMS = [
 ]
 
 
-def plot_training(curves: dict, out: Path) -> None:
-    """Two panels that between them replace most of the section's prose.
+def _ppo_curve(curves: dict, key: str, title: str):
+    """One metric, all four PPO arms. Returns (fig, ax) for the caller to finish and save.
 
-    Left: format compliance separates the arms cleanly and shows PPO-OR flatlining at zero.
-    Right: searches per episode, which is the whole of the "a search penalty is not what bounds
-    search" finding -- PPO-MR runs the penalty at zero and still sits near 2, while PPO-OR pins
-    itself to the 4-turn cap. Stated as numbers that comparison needs three sentences.
+    Format compliance and searches per episode used to share a figure, but they support two
+    different findings in the README, and a section whose only evidence is half a chart filed
+    under the previous heading reads as having no evidence at all.
     """
-    fig, (fmt_ax, turn_ax) = _fig(11, 4.2, ncols=2)
+    fig, (ax,) = _fig(7.4, 4.0)
+    for name, arm, colour in PPO_ARMS:
+        series = curves[arm]
+        ax.plot(series["step"], _smooth(series[key]), color=colour, linewidth=2.0, label=name)
+    ax.set_xlabel("training step", fontsize=9, color=INK_SOFT)
+    fig.suptitle(title, fontsize=12.5, color=INK, x=0.011, ha="left", y=0.985)
+    # Where PPO-OR's curve stops is visible in the curve itself; only the smoothing needs saying.
+    fig.text(0.011, 0.015, "15-step rolling mean.", fontsize=8.5, color=INK_SOFT)
+    return fig, ax
 
-    for ax, key, title in (
-        (fmt_ax, "format_compliance", "Answers in the required format"),
-        (turn_ax, "mean_tool_turns", "Searches per episode"),
-    ):
-        for name, arm, colour in PPO_ARMS:
-            series = curves[arm]
-            ax.plot(
-                series["step"],
-                _smooth(series[key]),
-                color=colour,
-                linewidth=2.0,
-                label=name if key == "format_compliance" else None,
-            )
-        ax.set_xlabel("training step", fontsize=9, color=INK_SOFT)
-        ax.set_title(title, fontsize=11, color=INK, pad=8, loc="left")
 
-    fmt_ax.set_ylim(0, 1.02)
-    fmt_ax.legend(frameon=False, fontsize=8.5, loc="center right", labelcolor=INK_SOFT)
+def plot_format(curves: dict, out: Path) -> None:
+    """PPO-OR flatlining to zero answers while the reward-shaped arms hold near 0.8."""
+    fig, ax = _ppo_curve(curves, "format_compliance", "PPO-OR stops answering entirely")
+    ax.set_ylim(0, 1.02)
+    ax.legend(frameon=False, fontsize=8.5, loc="center right", labelcolor=INK_SOFT)
+    fig.tight_layout(rect=(0, 0.04, 1, 0.93))
+    fig.savefig(out, dpi=200, facecolor=SURFACE)
+    plt.close(fig)
+
+
+def plot_searches(curves: dict, out: Path) -> None:
+    """Searches per episode: the arm with no search penalty is not the one that runs away."""
+    fig, ax = _ppo_curve(
+        curves, "mean_tool_turns", "The unpenalised arm is not the one that searches to the cap"
+    )
+    ax.set_ylim(0, 4.4)
     # The cap is what makes "uncontrolled search" legible -- without it the reader cannot tell
     # whether 4 turns per episode is a lot.
-    turn_ax.axhline(4, color=LOSS, linewidth=1.0, linestyle="--")
-    turn_ax.text(20, 3.82, "4-turn cap", fontsize=8, color=LOSS, va="top")
-    turn_ax.set_ylim(0, 4.4)
-
-    fig.suptitle(
-        "PPO-OR stops answering and searches to the cap; the reward-shaped arms do neither",
-        fontsize=12.5,
-        color=INK,
-        x=0.007,
-        ha="left",
-        y=0.99,
-    )
-    # Where PPO-OR's curve stops is visible in the curve itself; only the smoothing needs saying.
-    fig.text(0.007, 0.015, "15-step rolling mean.", fontsize=8.5, color=INK_SOFT)
-    fig.tight_layout(rect=(0, 0.04, 1, 0.95))
+    ax.axhline(4, color=LOSS, linewidth=1.0, linestyle="--")
+    ax.text(20, 3.82, "4-turn cap", fontsize=8, color=LOSS, va="top")
+    ax.legend(frameon=False, fontsize=8.5, loc="lower right", labelcolor=INK_SOFT)
+    fig.tight_layout(rect=(0, 0.04, 1, 0.93))
     fig.savefig(out, dpi=200, facecolor=SURFACE)
     plt.close(fig)
 
@@ -480,9 +475,10 @@ def main() -> None:
     plot_vs_paper(summary, RESULTS / "phase7c_vs_paper.png")
     plot_decomposition(summary, RESULTS / "phase7c_decomposition.png")
     plot_collapse(curves, RESULTS / "phase7c_collapse.png")
-    plot_training(curves, RESULTS / "phase7c_training.png")
+    plot_format(curves, RESULTS / "phase7c_format.png")
+    plot_searches(curves, RESULTS / "phase7c_searches.png")
     plot_followups(RESULTS / "followup_experiments_comparison.png")
-    print("wrote 5 figures to results/")
+    print("wrote 6 figures to results/")
 
 
 if __name__ == "__main__":
