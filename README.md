@@ -262,22 +262,16 @@ incentive is genuinely risky under GRPO, and a denser reward is real but **incom
 
 </details>
 
-### Key learnings
+### What went wrong first
 
-1. **A published delta that moves two variables at once is worth decomposing before building on
-   it.** The paper's turn-level gain reproduced — but most of the credit belongs to *what* the
-   reward contains, not to the turn-level *placement* the paper's contribution is named for.
-2. **Reward density is a training-stability property, not just an efficiency one.** A binary reward
-   killed both outcome-only arms, but by different routes: under GRPO it was an absorbing state
-   (zero within-group variance means a gradient of exactly zero, and nothing recovers), while PPO's
-   critic kept the gradient alive and still converged on a model that never answers.
-3. **Diagnose the mechanism, not the symptom.** A completely broken model retrieved about as well
-   as the arms that worked, and the arm running *without* the paper's anti-search penalty searched
-   no more than the penalized ones. Headline metrics pointed the wrong way in both cases; only the
-   per-step curves explained what happened.
-4. **Reproduce faithfully before improving.** An early pass here measured turn-level placement
-   against a "cleaner" baseline of our own design and concluded the paper's central claim *didn't*
-   reproduce. It did — our own deviation was hiding it.
+The decomposition above exists by accident. `PPO-MR + content` was built as a "cleaner" PPO-MR
+before the paper's actual definition was checked — and measured against *that*, the paper's central
+claim appeared **not** to reproduce. It does. Our own deviation was hiding it, and the error only
+surfaced when the results were written up and the paper re-read.
+
+The accidental arm turned out to be the useful one, but the lesson runs the other way: reproduce
+faithfully first, then improve. A baseline you designed yourself cannot tell you whether someone
+else's result holds.
 
 
 ## Future work
