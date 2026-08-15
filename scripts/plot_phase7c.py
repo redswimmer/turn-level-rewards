@@ -103,7 +103,7 @@ def plot_vs_paper(summary: dict, out: Path) -> None:
                 ax.text(
                     0.012,
                     i - 0.19,
-                    f"ours collapsed ({ours[i]:.3f})",
+                    "ours collapsed",
                     va="center",
                     fontsize=7.5,
                     color=OURS,
