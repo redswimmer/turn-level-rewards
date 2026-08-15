@@ -92,17 +92,21 @@ def plot_vs_paper(summary: dict, out: Path) -> None:
         ax.barh([i + 0.19 for i in y], paper, height=0.36, color=PAPER, label="Paper (Qwen2.5-7B)")
         ax.barh([i - 0.19 for i in y], ours, height=0.36, color=OURS, label="This repo (0.8B)")
         for i, arm in enumerate(arms):
+            # Coloured to the paper's series for the same reason as the "ours collapsed" label
+            # below: a neutral grey label between two bars is ambiguous about which one it means.
             if PAPER_ANCHORS[arm][idx] is None:
-                ax.text(0.008, i + 0.19, "not reported", va="center", fontsize=7.5, color=INK_SOFT)
-            # A bar at ~0 is indistinguishable from a missing bar, so say what it means.
+                ax.text(0.008, i + 0.19, "not reported", va="center", fontsize=7.5, color=PAPER)
+            # A bar at ~0 is indistinguishable from a missing bar, so say what it means. Coloured
+            # to match our own bars, not the loss red -- red sits too close to the paper's orange
+            # and reads as labelling the paper's bar instead of the missing one.
             if ours[i] < 0.02:
                 ax.text(
                     0.012,
                     i - 0.19,
-                    f"collapsed ({ours[i]:.3f})",
+                    f"ours collapsed ({ours[i]:.3f})",
                     va="center",
                     fontsize=7.5,
-                    color=LOSS,
+                    color=OURS,
                     weight="bold",
                 )
         ax.set_yticks(list(y), arms, fontsize=9.5)

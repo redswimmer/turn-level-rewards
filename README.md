@@ -146,7 +146,7 @@ Note what `R^I` contains that `PPO-MR` does not: a per-turn format term and a se
 ## Results
 
 Every arm below: same model, same scaffold, same seed, same dataset, 500 training steps (except
-`PPO-OR`, stopped at 159 once it had collapsed), evaluated on the same 7,404 held-out questions.
+`PPO-OR`, stopped once it had collapsed), evaluated on the same 7,404 held-out questions.
 Only the reward differs.
 
 ![This reproduction against the paper's published results](results/phase7c_vs_paper.png)
