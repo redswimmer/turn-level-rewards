@@ -180,18 +180,24 @@ Same reward, opposite fates — the only thing that changed is scale:
 
 Why mine and not the paper's? My best guess is scale. A batch with zero correct answers teaches
 nothing — every rollout scores the same, so the gradient is zero — and that gets more likely as
-the model gets weaker and the batch gets smaller. Mine is much smaller on both. Unverified: I
-never ran the paper's scale. The test: step up through the model family (Qwen3.5 ships 2B and 4B)
+the model gets weaker and the batch gets smaller. Mine is much smaller on both: a 0.8B model
+against the paper's 7B, and a batch 128× smaller (one RTX 4090 against their 8 H100s).
+Unverified: I never ran the paper's scale. The test: step up through the model family (Qwen3.5 ships 2B and 4B)
 and see where the collapse stops.
 
 ### A search penalty is not what prevents runaway searching
 
+`MT-PPO` is penalized for each search; the other two arms are not. The paper says that without
+this penalty, models search out of control.
+
 ![Searches per episode: the unpenalised arm sits near 2 while the collapsed arm pins to the cap](results/phase7c_searches.png)
 
-The paper says removing its search-count penalty causes "uncontrolled search usage." `PPO-MR` runs
-that penalty at zero and settles near 2 searches per episode. What actually bounds searching is the
-+0.2 reward for a wrong-but-formatted answer — always something to gain by stopping and committing.
-`PPO-OR`, the arm with no such term, is the one that searched to the cap forever.
+Half of this matches the paper: runaway searching is real — `PPO-OR` climbed to the 4-search cap
+and stayed there. The other half doesn't: the paper blames the missing penalty, but `PPO-MR` is
+missing it too and settled at about 2 searches per question, same as the penalized `MT-PPO`. My
+guess at why: what `PPO-OR` uniquely lacks isn't the penalty but any reward for answering — it
+gets nothing unless the answer is exactly right, so it had no reason to ever stop, while `PPO-MR`
+gets a small reward for any well-formed answer, so stopping always pays a little.
 
 ### The paper's headline result reproduced
 
