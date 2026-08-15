@@ -11,33 +11,263 @@ import argparse
 import inspect
 import itertools
 import json
+import math
+import os
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+import bitsandbytes as bnb
 import torch
 import torch.nn as nn
 import trackio
+from torch.utils.checkpoint import checkpoint
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     PreTrainedModel,
     Trainer,
     TrainingArguments,
+    get_constant_schedule,
 )
-from transformers.trainer_utils import set_seed
+from transformers.trainer_callback import TrainerState
+from transformers.trainer_utils import get_last_checkpoint, rotate_checkpoints, set_seed
 from trl.chat_template_utils import add_response_schema, get_training_chat_template, parse_response
 
 from turn_level_rewards.env import SearchEnv
-from turn_level_rewards.rewards import TURN_REWARD_SCALE, format_reward, outcome_reward
+from turn_level_rewards.rewards import (
+    TURN_REWARD_SCALE,
+    _extract_answer,
+    paper_baseline_turn_reward,
+    paper_binary_outcome_reward,
+    paper_outcome_reward,
+    paper_turn_reward,
+)
 
-Condition = Literal["ppo", "mt_ppo"]
+Condition = Literal["ppo", "ppo_mr", "ppo_mr_paper", "mt_ppo"]
 
 MODEL_NAME = "Qwen/Qwen3.5-0.8B"
 
 _SAMPLE_COMPLETION_INTERVAL = 10
+
+# Positions per gradient-checkpointed lm_head chunk. Memory-only knob: it changes peak
+# memory, never the numbers. See gather_action_logprobs for the measurements behind 256.
+LOGPROB_CHUNK_SIZE = 256
+
+_DEAD_REWARD_STEP_THRESHOLD = 20
+_FORMAT_COLLAPSE_STREAK_THRESHOLD = 20
+
+
+def resolve_stop_token_ids(
+    tokenizer_eos_token_id: int, model_eos_token_id: int | list[int] | None
+) -> list[int]:
+    """Token ids that end a single assistant turn, tokenizer's own eos first.
+
+    Load-bearing, and the root cause of the 2026-07-24 flat-reward incident when it was missing.
+    A chat model has two different "end" tokens and they are not interchangeable: for
+    Qwen/Qwen3.5-0.8B, `tokenizer.eos_token_id` is `<|im_end|>` (248046, ends an assistant TURN)
+    while `model.generation_config.eos_token_id` is `<|endoftext|>` (248044, ends a DOCUMENT).
+    `generate()` defaults to the model's, so without this a turn never stops at its own
+    terminator: the policy sails past `<|im_end|>` and keeps decoding until it happens to emit
+    `<|endoftext|>` or hits max_new_tokens.
+
+    Two separate harms followed, both confirmed against real run data, not theorised:
+      1. TRL's response template closes the `content` field at `<|im_end|>`, so trailing text
+         opened a SECOND content region that overwrote the first -- the model's real
+         `<answer>...</answer>` was discarded before format_reward/outcome_reward ever saw it, and
+         reward was a constant -0.1 for 100% of 332 episodes (zero variance, so PPO advantages
+         collapsed to ~0 and the policy stopped moving by ~step 20).
+      2. The overrun decoded into hallucinated `<|im_start|>user`/`<tool_response>` turns -- the
+         policy role-playing the environment -- inflating per-turn token counts (p95 1928, max
+         3289 action tokens for a task whose correct answer is ~16) and driving the run's ~15%
+         per-step CUDA OOM rate.
+
+    TRL's own GRPOTrainer does exactly this override (`grpo_trainer.py`, `"eos_token_id":
+    self._tokenizer.eos_token_id`, with a comment citing transformers#42762), which is why the
+    Phase 5/6 GRPO runs were unaffected -- this hand-built rollout loop simply did not inherit it.
+    Both ids are kept, not just the tokenizer's: a genuine `<|endoftext|>` should still stop
+    generation rather than decode into whatever follows it.
+    """
+    model_ids = (
+        []
+        if model_eos_token_id is None
+        else [model_eos_token_id]
+        if isinstance(model_eos_token_id, int)
+        else list(model_eos_token_id)
+    )
+    stop_ids = [tokenizer_eos_token_id]
+    stop_ids.extend(token_id for token_id in model_ids if token_id not in stop_ids)
+    return stop_ids
+
+
+def truncate_after_stop_token(token_ids: list[int], stop_token_ids: list[int]) -> list[int]:
+    """Cut a generated turn at its first stop token (kept), dropping anything after it.
+
+    Defense in depth behind resolve_stop_token_ids, not a redundant second copy of it: passing
+    the right `eos_token_id` to `generate()` is what SHOULD make this a no-op, but this is the
+    guarantee that the action mask can never extend past a turn boundary even if that ever
+    regresses again. _rollout_episode marks every returned token `action_mask=1`, so an overrun
+    does not merely waste tokens -- PPO would compute ratios and GAE over tokens where the policy
+    is impersonating the retrieval server, training it to fabricate tool output.
+
+    A turn with no stop token (hit max_new_tokens mid-sentence) is returned whole: that is a real
+    truncated turn, and silently emptying it would destroy the episode rather than record it.
+    """
+    stops = set(stop_token_ids)
+    for index, token_id in enumerate(token_ids):
+        if token_id in stops:
+            return token_ids[: index + 1]
+    return token_ids
+
+
+@dataclass
+class _CollapseAlert:
+    title: str
+    text: str
+    level: str  # "ERROR" or "WARN"
+    should_stop: bool = False
+
+
+class CollapseMonitor:
+    """Pure, testable collapse-visibility state machine for MTPPOTrainer.train()'s per-step loop.
+
+    Mirrors train.py's TrackioAlertCallback pattern (non-finite loss stops training; reward
+    stuck at 0 for too long is a dead-signal alert) but adapted for PPO -- there is no
+    frac_reward_zero_std here (a GRPO group-relative-advantage concept this trainer has no
+    equivalent of), and a new format-compliance-collapse check is added instead: the paper's own
+    PPO-OR baselines are documented as prone to crashing (arXiv:2505.11821v2 Section 6.1,
+    "PPO baselines often crash"), and this exists to make that visible live from the trackio
+    curves alone, not to auto-rollback -- see
+    docs/superpowers/specs/2026-07-23-phase-7b-full-ppo-runs-design.md's "policy collapse"
+    decision for why an automated rollback would be inventing a mechanism the paper never
+    describes.
+
+    Returns _CollapseAlert instances instead of calling trackio.alert directly, so this class is
+    unit-testable without a live trackio backend -- trackio.alert itself is the external seam,
+    kept in train()'s caller (cosmicpython dependency-inversion, same principle CLAUDE.md's
+    Guiding principles section already applies throughout this repo).
+    """
+
+    def __init__(self) -> None:
+        self._reward_ever_nonzero = False
+        self._dead_reward_alerted = False
+        self._distinct_rewards: set[float] = set()
+        self._constant_reward_alerted = False
+        self._format_ever_compliant = False
+        self._format_collapse_streak = 0
+        self._format_collapse_alerted = False
+        self._format_never_compliant_alerted = False
+
+    def check(
+        self, step: int, loss: float, mean_reward: float, mean_format_reward: float
+    ) -> list[_CollapseAlert]:
+        if not math.isfinite(loss):
+            return [
+                _CollapseAlert(
+                    title="Non-finite loss",
+                    text=f"Loss is {loss} at step {step} -- stopping training.",
+                    level="ERROR",
+                    should_stop=True,
+                )
+            ]
+
+        alerts: list[_CollapseAlert] = []
+
+        if mean_reward != 0.0:
+            self._reward_ever_nonzero = True
+        if (
+            not self._reward_ever_nonzero
+            and not self._dead_reward_alerted
+            and step >= _DEAD_REWARD_STEP_THRESHOLD
+        ):
+            alerts.append(
+                _CollapseAlert(
+                    title="Dead reward",
+                    text=(
+                        f"Reward has been exactly 0.0 for all {step + 1} steps so far -- "
+                        "possible miswired reward function, tool-calling loop, or policy "
+                        "collapse."
+                    ),
+                    level="ERROR",
+                )
+            )
+            self._dead_reward_alerted = True
+
+        # A reward pinned at ONE value carries no more learning signal than a reward pinned at
+        # zero -- PPO's advantage is (return - baseline), and a critic converges onto a constant
+        # almost immediately, driving advantages to ~0. The pre-existing dead-reward check above
+        # could not see this: it tests `mean_reward != 0.0`, so the 2026-07-24 incident's constant
+        # -0.1 marked the reward "alive" on step 0 and suppressed the alert for all 177 steps
+        # while nothing was being learned. Distinct-value counting catches the general case.
+        self._distinct_rewards.add(mean_reward)
+        if (
+            self._reward_ever_nonzero
+            and len(self._distinct_rewards) == 1
+            and not self._constant_reward_alerted
+            and step >= _DEAD_REWARD_STEP_THRESHOLD
+        ):
+            alerts.append(
+                _CollapseAlert(
+                    title="Constant reward",
+                    text=(
+                        f"Mean reward has been exactly {mean_reward} on all {step + 1} steps so "
+                        "far -- zero variance means near-zero PPO advantage regardless of the "
+                        "reward's magnitude. Check that completions are being parsed as the "
+                        "reward functions expect (a rollout-loop bug can score every episode "
+                        "identically without ever erroring)."
+                    ),
+                    level="ERROR",
+                )
+            )
+            self._constant_reward_alerted = True
+
+        if mean_format_reward > 0.0:
+            self._format_ever_compliant = True
+            self._format_collapse_streak = 0
+            self._format_collapse_alerted = False
+        elif self._format_ever_compliant:
+            self._format_collapse_streak += 1
+            if (
+                self._format_collapse_streak >= _FORMAT_COLLAPSE_STREAK_THRESHOLD
+                and not self._format_collapse_alerted
+            ):
+                alerts.append(
+                    _CollapseAlert(
+                        title="Format compliance collapsed",
+                        text=(
+                            f"format_reward has been non-positive for "
+                            f"{self._format_collapse_streak} consecutive steps after previously "
+                            "being compliant -- likely policy collapse (matches the paper's own "
+                            "documented PPO-OR instability). Check trackio curves and consider "
+                            "evaluating an earlier checkpoint."
+                        ),
+                        level="WARN",
+                    )
+                )
+                self._format_collapse_alerted = True
+        elif not self._format_never_compliant_alerted and step >= _FORMAT_COLLAPSE_STREAK_THRESHOLD:
+            # The branch above only fires on a REGRESSION from a compliant state, so a run that
+            # was never once compliant -- the actual 2026-07-24 signature -- fell through both
+            # branches silently. Never-compliant is the more urgent diagnosis of the two: a
+            # collapse means the policy lost something it had, this means the plumbing between
+            # generation and the reward functions may never have worked at all.
+            alerts.append(
+                _CollapseAlert(
+                    title="Format never compliant",
+                    text=(
+                        f"format_reward has been non-positive on every one of the first "
+                        f"{step + 1} steps -- no completion has ever parsed as a well-formed "
+                        "<answer>. Suspect the rollout/parsing path before suspecting the policy."
+                    ),
+                    level="ERROR",
+                )
+            )
+            self._format_never_compliant_alerted = True
+
+        return alerts
 
 
 @dataclass
@@ -57,9 +287,14 @@ class MTPPOConfig(TrainingArguments):
     gae_lambda: float = 1.0
     num_ppo_epochs: int = 4
     value_loss_coef: float = 0.5
+    use_8bit_optimizer: bool = True
     num_rollouts_per_step: int = 2
+    save_steps: int = 50
+    save_total_limit: int = 3
     max_completion_length: int = 2048
-    project: str = "turn-level-rewards-ppo"
+    # Shared with the paper-faithful GRPO arms (train.py) so every arm overlays in one
+    # dashboard. The PPO arms all use the paper's reward design as of Phase 7c.
+    project: str = "turn-level-rewards-paper"
 
 
 def build_ppo_config(
@@ -67,6 +302,9 @@ def build_ppo_config(
     seed: int,
     max_steps: int,
     num_rollouts_per_step: int,
+    save_steps: int = 50,
+    save_total_limit: int = 3,
+    use_8bit_optimizer: bool = True,
 ) -> MTPPOConfig:
     """Build the MTPPOConfig for a training run. Mirrors train.py's build_config role from
     Phase 4 -- fixed hyperparameters are baked in here, not exposed as independent CLI flags.
@@ -85,7 +323,10 @@ def build_ppo_config(
         gae_lambda=1.0,
         num_ppo_epochs=4,
         value_loss_coef=0.5,
+        use_8bit_optimizer=use_8bit_optimizer,
         num_rollouts_per_step=num_rollouts_per_step,
+        save_steps=save_steps,
+        save_total_limit=save_total_limit,
         max_completion_length=2048,
         logging_steps=1,
         run_name=condition,
@@ -122,6 +363,58 @@ def compute_gae(
         advantages[t] = running_gae
         next_value = values[t]
     return advantages
+
+
+def place_paper_rewards(
+    num_tokens: int,
+    turn_boundary_token_indices: list[int],
+    turn_rewards: list[float],
+    outcome_reward_value: float,
+    condition: Condition,
+) -> list[float]:
+    """Place the paper's R^I / R^O onto the action-token sequence, per condition.
+
+    The three arms differ ONLY in where reward lands -- the components are computed by the
+    caller (rewards.paper_turn_reward / paper_outcome_reward / paper_binary_outcome_reward), so
+    this function is the whole of the OR/MR/MT distinction and nothing else:
+
+      ppo     (PPO-OR) : R^O alone, on the last token. Section 6.1: "vanilla PPO trained with
+                         only outcome rewards, where the trajectory-level reward is a binary
+                         signal indicating final-answer correctness." No R^I at all.
+      ppo_mr  (PPO-MR) : R^O + sum(R^I), ALL on the last token. Section 6.1 calls this a
+                         "trajectory-level reward [that] combines intermediate rewards
+                         (retrieval correctness) and outcome rewards" -- same information as
+                         MT-PPO, collapsed into one terminal scalar.
+      mt_ppo  (MT-PPO) : R^I at each intermediate turn boundary, R^O on the last token. This is
+                         Eq. 9, and the paper's actual contribution.
+
+    PPO-MR is the control that makes the ablation interpretable. ppo -> ppo_mr isolates the
+    value of the extra reward signal; ppo_mr -> mt_ppo isolates the value of turn-level
+    placement. Comparing only ppo to mt_ppo (as this repo did before) changes both at once, so
+    any measured advantage could not be attributed to Eq. 9.
+
+    turn_boundary_token_indices index the compressed ACTION-token sequence (policy-generated
+    tokens only) -- see _rollout_episode's docstring.
+    """
+    if len(turn_boundary_token_indices) != len(turn_rewards):
+        raise ValueError(
+            f"turn_boundary_token_indices ({len(turn_boundary_token_indices)}) and turn_rewards "
+            f"({len(turn_rewards)}) must be equal length"
+        )
+    if num_tokens < 1:
+        raise ValueError(f"num_tokens must be >= 1, got {num_tokens}")
+
+    per_token_rewards = [0.0] * num_tokens
+    per_token_rewards[-1] += outcome_reward_value
+
+    if condition in ("ppo_mr", "ppo_mr_paper"):
+        per_token_rewards[-1] += sum(turn_rewards)
+    elif condition == "mt_ppo":
+        for token_index, turn_reward_value in zip(
+            turn_boundary_token_indices, turn_rewards, strict=True
+        ):
+            per_token_rewards[token_index] += turn_reward_value
+    return per_token_rewards
 
 
 def place_turn_rewards(
@@ -196,13 +489,43 @@ def compute_ppo_loss(
     clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
     policy_loss = -_masked_mean(torch.min(unclipped, clipped), action_mask)
     value_loss = _masked_mean((new_values - returns) ** 2, action_mask)
-    kl = _masked_mean(new_logprobs - old_logprobs, action_mask)
+    # Schulman's k3 estimator: exp(d) - d - 1 with d = old - new. Non-negative by construction,
+    # low variance, and the same estimator TRL's GRPO uses.
+    #
+    # The original implementation used mean(new_logprobs - old_logprobs) directly. Over tokens
+    # sampled from the OLD policy that expectation is -KL(old||new) <= 0, so adding
+    # +kl_beta * it to the loss and minimising MAXIMISED divergence from the rollout policy --
+    # the exact opposite of the trust region the term is documented to provide. kl_beta=0.001
+    # kept the magnitude small, but the sign was backwards, leaving PPO with no trust region
+    # beyond clipping plus a slight push away from it.
+    log_ratio_reversed = old_logprobs - new_logprobs
+    kl = _masked_mean(torch.exp(log_ratio_reversed) - log_ratio_reversed - 1.0, action_mask)
     loss = policy_loss + value_loss_coef * value_loss + kl_beta * kl
+
+    # Diagnostic-only fields (no gradient contribution) -- mirror TRL's own PPOTrainer metric
+    # set (`val/ratio`, `val/ratio_var`, `policy/clipfrac_avg` -- see
+    # docs/trl/v1.9.0/ppo_trainer's "Explanation of the logged metrics"), the standard PPO
+    # health signals for diagnosing an unstable run from trackio curves alone. clip_fraction
+    # uses the raw (pre-clip) ratio against the same clip_eps bounds compute_ppo_loss itself
+    # clips to, so it reports exactly what fraction of this batch's surrogate objective was
+    # actually clamped. To avoid inf * 0.0 = nan when masking out positions with very large
+    # exponents, we replace inf values with a large but finite sentinel (1e6) for the
+    # diagnostic computation -- this preserves the "clipped or not" decision (both are way outside
+    # bounds) while avoiding nan propagation.
+    ratio_safe = torch.where(torch.isinf(ratio), torch.full_like(ratio, 1e6), ratio)
+    ratio_mean = _masked_mean(ratio_safe, action_mask)
+    ratio_variance = _masked_mean((ratio_safe - ratio_mean) ** 2, action_mask)
+    is_clipped = (ratio < 1.0 - clip_eps) | (ratio > 1.0 + clip_eps)
+    clip_fraction = _masked_mean(is_clipped.float(), action_mask)
+
     return {
         "loss": loss,
         "policy_loss": policy_loss.detach(),
         "value_loss": value_loss.detach(),
         "kl": kl.detach(),
+        "ratio_mean": ratio_mean.detach(),
+        "ratio_variance": ratio_variance.detach(),
+        "clip_fraction": clip_fraction.detach(),
     }
 
 
@@ -249,6 +572,29 @@ def build_policy_and_critic(model_name: str = MODEL_NAME) -> _PolicyAndCritic:
     return _PolicyAndCritic(policy, critic)
 
 
+def _final_retrieval_fraction(rollout: dict) -> float:
+    """The episode's final (cumulative) retrieval_fraction -- 0.0 if the episode made no search
+    calls at all. Shared by _collect_batch (train-time) and evaluate_ppo.py (eval-time) so both
+    extract this the same way.
+    """
+    fractions = rollout["retrieval_fraction_after_each_turn"]
+    return fractions[-1] if fractions else 0.0
+
+
+def _row_cycle_from_step(
+    rows: list[dict], global_step: int, num_rollouts_per_step: int
+) -> Iterator[dict]:
+    """An infinite cycle over rows, fast-forwarded to the position a from-scratch run would be
+    at after global_step completed steps -- so resuming from a checkpoint reproduces the exact
+    same data order a run that never stopped would have seen. itertools.cycle over a fixed list
+    is deterministic, so replaying the same number of draws always lands in the same place.
+    """
+    cycle = itertools.cycle(rows)
+    for _ in range(global_step * num_rollouts_per_step):
+        next(cycle)
+    return cycle
+
+
 class MTPPOTrainer(Trainer):
     """Custom multi-turn PPO trainer with tool-calling, built directly on transformers.Trainer.
 
@@ -277,26 +623,61 @@ class MTPPOTrainer(Trainer):
         super().__init__(model=model, args=args, train_dataset=train_dataset, callbacks=callbacks)
         self.tokenizer = add_response_schema(tokenizer)
         self.training_chat_template = get_training_chat_template(self.tokenizer)
+        # Resolved once here rather than per-generate call so the policy's own generation_config
+        # is read before any of it is mutated, and so a mismatch is visible in one place. See
+        # resolve_stop_token_ids' docstring for why this is not optional.
+        self.stop_token_ids = resolve_stop_token_ids(
+            self.tokenizer.eos_token_id, model.policy.generation_config.eos_token_id
+        )
 
     # create_optimizer(self) intentionally omits the base transformers.Trainer.create_optimizer's
     # optional `model` parameter. The internal Trainer code path that passes it positionally
     # is only reached for FSDP-XLA, SageMaker MP-DP, or DataParallel; this repo's single-GPU
     # setup (per CLAUDE.md's Hardware section) never triggers it, so the omission is safe.
     def create_optimizer(self) -> torch.optim.Optimizer:  # ty: ignore[invalid-method-override]
-        """One AdamW, two param groups -- policy_lr / critic_lr per the paper's spec (10x apart)."""
+        """One AdamW, two param groups -- policy_lr / critic_lr per the paper's spec (10x apart).
+
+        Also sets self.lr_scheduler to a no-op constant schedule (this trainer never decays either
+        learning rate -- the paper's own spec fixes policy_lr/critic_lr for the run's duration).
+        This is load-bearing, not cosmetic: a real bug found while verifying Task 5's
+        checkpoint-resume fix -- transformers.Trainer.__init__ initializes self.lr_scheduler to
+        None, and train() never otherwise assigns it, so Trainer's own inherited
+        _save_optimizer_and_scheduler/_load_optimizer_and_scheduler (used by
+        _save_full_checkpoint/_load_full_checkpoint) unconditionally call
+        self.lr_scheduler.state_dict()/.load_state_dict() -- a real crash on the very first
+        checkpoint save, `AttributeError: 'NoneType' object has no attribute 'state_dict'`,
+        confirmed by direct reproduction. get_constant_schedule's LambdaLR holds only a reference
+        to the optimizer plus a step counter (no per-parameter tensor state), so unlike the
+        optimizer itself, there is no analogous orphaned-reference risk here across a resume.
+        """
         # self.model.policy, self.model.critic, self.args.policy_lr, and self.args.critic_lr
         # are all real attributes defined on this file's _PolicyAndCritic and MTPPOConfig
         # classes respectively. They are safe; ty's inability to see through Trainer's looser
         # base types is not a real issue here.
-        self.optimizer = torch.optim.AdamW(
+        # 8-bit optimizer states, for memory not for speed. AdamW keeps two fp32 states per
+        # parameter across BOTH the policy and the critic, measured at ~6.4 GB of this setup's
+        # ~10 GB static floor on a 24 GB card; 8-bit quantization takes that to ~3.2 GB.
+        #
+        # This is load-bearing for experimental validity, not just throughput. Without it,
+        # mt_ppo skips OOM steps that ppo/ppo_mr do not (its turn reward produces longer
+        # episodes), so the arms of the comparison silently receive different numbers of real
+        # gradient updates -- the exact confound that invalidated the 2026-07-25 runs, where
+        # mt_ppo got 431 updates against ppo's 499. Measured: 13.8% skips before the log-prob
+        # chunking fix, 2.8% after it, 0% with this as well.
+        #
+        # AdamW8bit is a drop-in for torch.optim.AdamW (same update rule, quantized state), so
+        # it changes memory rather than optimization semantics.
+        optimizer_class = bnb.optim.AdamW8bit if self.args.use_8bit_optimizer else torch.optim.AdamW  # ty: ignore[unresolved-attribute]
+        self.optimizer = optimizer_class(
             [
                 {"params": self.model.policy.parameters(), "lr": self.args.policy_lr},  # ty: ignore[unresolved-attribute]
                 {"params": self.model.critic.parameters(), "lr": self.args.critic_lr},  # ty: ignore[unresolved-attribute]
             ]
         )
+        self.lr_scheduler = get_constant_schedule(self.optimizer)
         return self.optimizer
 
-    def _rollout_episode(self, row: dict) -> dict:
+    def _rollout_episode(self, row: dict, greedy: bool = False) -> dict:
         """Run one multi-turn episode for a single dataset row: real generation, real tool calls
         against the real retrieval server (via self.environment_factory, e.g. SearchEnv).
 
@@ -334,9 +715,31 @@ class MTPPOTrainer(Trainer):
         action_mask: list[int] = []
         turn_boundary_action_indices: list[int] = []
         retrieval_fraction_after_each_turn: list[float] = []
+        # Per-turn inputs to the paper's R^I (rewards.paper_turn_reward): whether this
+        # turn's tool calls were well-formed, and how many searches have been issued in
+        # total up to and including this turn (the paper's n_search is cumulative).
+        turn_format_ok: list[bool] = []
+        cumulative_searches_after_each_turn: list[int] = []
+        searches_so_far = 0
         num_action_tokens = 0
 
-        for _turn in range(self.args.n_max):  # ty: ignore[unresolved-attribute]
+        # n_max + 1 generations for n_max tool rounds, so the policy ALWAYS gets one final turn
+        # after its last tool result in which to answer.
+        #
+        # The original loop was `for _turn in range(n_max)` with tool execution at the end of
+        # each pass, which meant a model that called a tool on the last pass had its tool
+        # executed and the episode then ended on a `role: tool` message -- no generation left in
+        # which to produce an <answer>, and a -0.1 format penalty for a turn it was never given.
+        # Measured over every logged episode: 58% of ppo and 21% of mt_ppo episodes ended that
+        # way, structurally unable to answer.
+        #
+        # This also made the PPO track incomparable to the GRPO track it is being measured
+        # against. TRL's GRPOTrainer._tool_call_loop runs `while tool_calls and iteration_num <
+        # max`, executing tools and THEN generating (grpo_trainer.py: tool message appended,
+        # then _generate_single_turn, then iteration_num += 1) -- so at the same nominal
+        # max_tool_calling_iterations=4, GRPO's conversations always end on a generation and
+        # ours could not. Verified in TRL's source, not assumed from documentation.
+        for _turn in range(self.args.n_max + 1):  # ty: ignore[unresolved-attribute]
             prompt_text = self.tokenizer.apply_chat_template(
                 messages,
                 tools=[environment.search],
@@ -371,11 +774,28 @@ class MTPPOTrainer(Trainer):
                 generation = policy.generate(  # ty: ignore[call-non-callable, unresolved-attribute]
                     input_ids,
                     max_new_tokens=self.args.max_completion_length,  # ty: ignore[unresolved-attribute]
-                    do_sample=True,
-                    temperature=1.0,
+                    # greedy=True is for EVALUATION. Training must sample -- exploration is where
+                    # the policy gradient comes from -- but scoring a fixed checkpoint with
+                    # temperature-1.0 sampling makes the benchmark itself random: the same
+                    # checkpoint on the same held-out set returns a different EM every run.
+                    #
+                    # That is not a cosmetic reproducibility issue here. The paper's MT-PPO
+                    # advantage over PPO-MR is +1.7 EM points, and this phase already has to
+                    # worry about whether one seed can resolve it. Adding a second, independent
+                    # source of noise on top of seed variance could easily be the difference
+                    # between seeing that effect and not. Standard benchmark practice is greedy
+                    # decoding, and the paper reports single point estimates, implying the same.
+                    do_sample=not greedy,
+                    **({} if greedy else {"temperature": 1.0}),
+                    # Without this, generate() falls back to the policy's own
+                    # generation_config.eos_token_id (<|endoftext|>, a DOCUMENT terminator) and
+                    # sails straight past each turn's <|im_end|>. See resolve_stop_token_ids.
+                    eos_token_id=self.stop_token_ids,
                 )
             policy.train()  # ty: ignore[unresolved-attribute]
-            new_token_ids = generation[0, len(prompt_token_ids) :].tolist()
+            new_token_ids = truncate_after_stop_token(
+                generation[0, len(prompt_token_ids) :].tolist(), self.stop_token_ids
+            )
             parsed = parse_response(self.tokenizer, new_token_ids, prefix=prompt_token_ids)
             messages.append(parsed)
 
@@ -386,7 +806,14 @@ class MTPPOTrainer(Trainer):
             tool_calls = parsed.get("tool_calls") or []
             if not tool_calls:
                 break  # final answer turn -- episode complete
+            if _turn == self.args.n_max:  # ty: ignore[unresolved-attribute]
+                # Tool budget exhausted. Stop WITHOUT executing this turn's calls: the episode
+                # already ends on a generation (the guarantee above), and running a tool whose
+                # result no turn can ever read would only add unattributable tokens. Matches
+                # TRL, whose loop likewise leaves the final turn's calls unexecuted.
+                break
 
+            turn_had_bad_call = False
             for tool_call in tool_calls:
                 # A real failure Task 13's live smoke test caught: an untrained (or
                 # early-training) policy can hallucinate a tool call that doesn't match
@@ -425,20 +852,20 @@ class MTPPOTrainer(Trainer):
                     )
                     continue
 
-                # Step 2: check the extracted arguments would bind against search()'s real
-                # signature WITHOUT calling it -- inspect.signature(...).bind() only performs
-                # Python's argument-binding logic (matching names/arity), it never executes
-                # search()'s body. A TypeError here (e.g. an unexpected keyword argument) is
-                # therefore guaranteed to be a real argument-mismatch caused by the model, not
-                # something that happened inside search().
-                try:
-                    inspect.signature(environment.search).bind(**call_args)
-                except TypeError as exc:
+                # Step 2: check the extracted arguments are a valid call to search() WITHOUT
+                # calling it -- names/arity via inspect binding, plus types against search()'s
+                # annotations. Neither check ever executes search()'s body, so anything caught
+                # here is guaranteed to be a model-produced argument mistake rather than
+                # something that happened inside search(). See validate_tool_call_arguments for
+                # why the type half is not optional.
+                argument_error = validate_tool_call_arguments(environment.search, call_args)
+                if argument_error is not None:
+                    turn_had_bad_call = True
                     messages.append(
                         {
                             "role": "tool",
                             "name": "search",
-                            "content": f"Error: invalid arguments for search(): {exc}",
+                            "content": f"Error: {argument_error}",
                         }
                     )
                     continue
@@ -452,8 +879,11 @@ class MTPPOTrainer(Trainer):
                 result = environment.search(**call_args)
                 messages.append({"role": "tool", "name": "search", "content": result})
 
+            searches_so_far += len(tool_calls)
             turn_boundary_action_indices.append(num_action_tokens - 1)
             retrieval_fraction_after_each_turn.append(environment.retrieval_fraction)
+            turn_format_ok.append(not turn_had_bad_call)
+            cumulative_searches_after_each_turn.append(searches_so_far)
 
         completion = messages[len(row["prompt"]) :]
         return {
@@ -462,6 +892,8 @@ class MTPPOTrainer(Trainer):
             "full_token_ids": full_token_ids,
             "action_mask": action_mask,
             "turn_boundary_action_indices": turn_boundary_action_indices,
+            "turn_format_ok": turn_format_ok,
+            "cumulative_searches_after_each_turn": cumulative_searches_after_each_turn,
             "retrieval_fraction_after_each_turn": retrieval_fraction_after_each_turn,
         }
 
@@ -528,10 +960,15 @@ class MTPPOTrainer(Trainer):
         # `.lm_head` (the vocab projection) are both real, always-callable submodules.
         policy_hidden = self.model.policy.model(input_ids=input_ids).last_hidden_state[0]  # ty: ignore[call-non-callable, unresolved-attribute]  # [seq_len, hidden]
         selected_hidden = policy_hidden[predict_positions]  # [num_action_tokens, hidden]
-        selected_logits = self.model.policy.lm_head(selected_hidden)  # ty: ignore[call-non-callable, unresolved-attribute]  # [num_action_tokens, vocab]
-        log_probs = torch.log_softmax(selected_logits, dim=-1)
         next_tokens = input_ids[0, action_indices]
-        return log_probs.gather(1, next_tokens.unsqueeze(-1)).squeeze(-1)
+        # Chunked rather than one [num_action_tokens, vocab] pass: identical numbers, but a peak
+        # that no longer grows with episode length. See gather_action_logprobs for the measured
+        # sizes and for why this was the term behind mt_ppo's 13.8% OOM step-skip rate.
+        return gather_action_logprobs(
+            self.model.policy.lm_head,  # ty: ignore[unresolved-attribute]
+            selected_hidden,
+            next_tokens,
+        )
 
     def _forward_critic_values(
         self, full_token_ids: list[int], action_mask: list[int]
@@ -580,6 +1017,8 @@ class MTPPOTrainer(Trainer):
         smoke test (Task 11).
         """
         episodes = []
+        raw_advantages: list[list[float]] = []
+        device = self.model.policy.device  # ty: ignore[unresolved-attribute]
         for row in rows:
             rollout = self._rollout_episode(row)
 
@@ -589,21 +1028,58 @@ class MTPPOTrainer(Trainer):
                 )
 
             completion = rollout["completion"]
-            format_r = format_reward([completion])[0]
-            outcome_r = outcome_reward([completion], [row["golden_answers"]])[0]
-            format_and_outcome_reward = format_r + outcome_r
+            # Paper-faithful rewards (arXiv:2505.11821v2 Sections 5.2/6.1), NOT the GRPO track's
+            # format/F1+EM rewards. Section 6.1 defines PPO-OR's reward as "a binary signal
+            # indicating final-answer correctness" with no format term at all; PPO-MR and MT-PPO
+            # use the graded R^O (+1.0 correct / +0.2 wrong-but-formatted / -1.0 bad format)
+            # plus per-turn R^I. See rewards.py's paper_* functions for why carrying the GRPO
+            # rewards into this track made the earlier Phase 7b runs a non-reproduction.
+            if self.condition == "ppo":
+                outcome_r = paper_binary_outcome_reward(completion, row["golden_answers"])
+            else:
+                outcome_r = paper_outcome_reward(completion, row["golden_answers"])
 
-            retrieval_fraction = (
-                rollout["retrieval_fraction_after_each_turn"][-1]
-                if rollout["retrieval_fraction_after_each_turn"]
-                else 0.0
-            )
+            # R^I per intermediate turn. found_gold is the MARGINAL retrieval gain, not the
+            # cumulative value: SearchEnv.retrieval_fraction only ever grows, so "ground truth in
+            # results" for THIS turn means the fraction rose during it.
+            #
+            # ppo_mr_paper uses the paper's BASELINE R^I -- retrieval correctness only. The
+            # per-turn format bonus and the lambda_s search penalty belong to MT-PPO's own
+            # Section 5.2 design, not to the PPO-MR baseline of Section 6.1; see
+            # paper_baseline_turn_reward's docstring for the quotes. ppo_mr keeps the full R^I
+            # deliberately, so that ppo_mr -> mt_ppo varies ONLY reward placement -- a cleaner
+            # isolation of Eq. 9 than the paper's own comparison, but NOT a reproduction of it.
+            # Both arms exist precisely so the difference is measurable rather than assumed.
+            previous_fraction = 0.0
+            turn_rewards = []
+            for fraction, format_ok, n_search in zip(
+                rollout["retrieval_fraction_after_each_turn"],
+                rollout["turn_format_ok"],
+                rollout["cumulative_searches_after_each_turn"],
+                strict=True,
+            ):
+                found_gold = fraction > previous_fraction
+                if self.condition == "ppo_mr_paper":
+                    turn_rewards.append(paper_baseline_turn_reward(found_gold=found_gold))
+                else:
+                    turn_rewards.append(
+                        paper_turn_reward(
+                            found_gold=found_gold,
+                            format_ok=format_ok,
+                            cumulative_searches=n_search,
+                        )
+                    )
+                previous_fraction = fraction
 
-            per_token_rewards = place_turn_rewards(
+            format_r = 1.0 if _extract_answer(completion) is not None else 0.0
+            format_and_outcome_reward = outcome_r
+            retrieval_fraction = _final_retrieval_fraction(rollout)
+
+            per_token_rewards = place_paper_rewards(
                 num_tokens=len(old_values),
                 turn_boundary_token_indices=rollout["turn_boundary_action_indices"],
-                retrieval_fraction_after_each_turn=rollout["retrieval_fraction_after_each_turn"],
-                format_and_outcome_reward=format_and_outcome_reward,
+                turn_rewards=turn_rewards,
+                outcome_reward_value=outcome_r,
                 condition=self.condition,
             )
             advantages = compute_gae(
@@ -618,8 +1094,14 @@ class MTPPOTrainer(Trainer):
                 gamma=self.args.gamma,  # ty: ignore[unresolved-attribute]
                 lam=self.args.gae_lambda,  # ty: ignore[unresolved-attribute]
             )
+            # returns deliberately use the RAW advantages: returns are the critic's regression
+            # target (the actual discounted return), so normalizing them would train the critic
+            # to predict a rescaled quantity that no longer matches the rewards it is supposed
+            # to estimate. Only the policy-loss advantages get normalized, below, across the
+            # whole batch.
             returns = [a + v for a, v in zip(advantages, old_values.tolist(), strict=True)]
 
+            raw_advantages.append(advantages)
             episodes.append(
                 {
                     "full_token_ids": rollout["full_token_ids"],
@@ -629,11 +1111,26 @@ class MTPPOTrainer(Trainer):
                     "advantages": torch.tensor(advantages, device=old_values.device),
                     "returns": torch.tensor(returns, device=old_values.device),
                     "format_and_outcome_reward": format_and_outcome_reward,
+                    "format_reward": format_r,
                     "retrieval_fraction": retrieval_fraction,
                     "question": row["question"],
                     "completion": completion,
+                    "turn_boundary_action_indices": rollout["turn_boundary_action_indices"],
                 }
             )
+
+        # Normalized ACROSS THE WHOLE BATCH, not per episode. Per-episode normalization would
+        # force every episode's advantages to zero mean, erasing the between-episode difference
+        # that says "this rollout was better than that one" -- which is most of the signal when
+        # the reward is dominated by a terminal outcome term.
+        normalized = normalize_advantages([a for episode in raw_advantages for a in episode])
+        offset = 0
+        for episode, raw in zip(episodes, raw_advantages, strict=True):
+            episode["advantages"] = torch.tensor(
+                normalized[offset : offset + len(raw)],
+                device=device,  # ty: ignore[invalid-argument-type]
+            )
+            offset += len(raw)
         return episodes
 
     def _ppo_update(self, episodes: list[dict]) -> dict[str, float]:
@@ -644,7 +1141,15 @@ class MTPPOTrainer(Trainer):
         with the single-RTX-4090, 0.8B-model memory profile the rest of this repo already
         established.
         """
-        totals = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "kl": 0.0}
+        totals = {
+            "loss": 0.0,
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "kl": 0.0,
+            "ratio_mean": 0.0,
+            "ratio_variance": 0.0,
+            "clip_fraction": 0.0,
+        }
         num_updates = 0
         # self.args.num_ppo_epochs is a real field on this file's MTPPOConfig, but Trainer's
         # base type stub only knows self.args as the looser `TrainingArguments` -- same
@@ -718,15 +1223,31 @@ class MTPPOTrainer(Trainer):
                 real_policy_loss = policy_loss_dict["policy_loss"]
                 real_kl = policy_loss_dict["kl"]
                 real_value_loss = value_loss_dict["value_loss"]
+                # ratio_mean/ratio_variance/clip_fraction come from pass 1 (real new_logprobs)
+                # for the same reason real_policy_loss/real_kl do -- pass 2's ratio is always
+                # exactly 1.0 (old_logprobs vs itself), which would silently dilute these
+                # diagnostics toward "everything looks fine" if averaged in.
                 totals["policy_loss"] += real_policy_loss.item()
                 totals["kl"] += real_kl.item()
                 totals["value_loss"] += real_value_loss.item()
+                totals["ratio_mean"] += policy_loss_dict["ratio_mean"].item()
+                totals["ratio_variance"] += policy_loss_dict["ratio_variance"].item()
+                totals["clip_fraction"] += policy_loss_dict["clip_fraction"].item()
                 totals["loss"] += (
                     real_policy_loss
                     + self.args.value_loss_coef * real_value_loss  # ty: ignore[unresolved-attribute]
                     + self.args.kl_beta * real_kl  # ty: ignore[unresolved-attribute]
                 ).item()
                 num_updates += 1
+
+            # Standard PPO practice, and absent until now. Gradients here are accumulated across
+            # every episode in the batch with no bound on their norm, so a single outlier episode
+            # (this repo's action-token counts reach 3,000+ against a median of ~150) can drive
+            # one update far outside the region the clipped surrogate is meant to keep the policy
+            # in. That is a textbook cause of exactly the failure observed on 2026-07-25: ppo's
+            # format compliance fell from 0.542 at step 399 to 0.120 by step 500.
+            # max_grad_norm comes from TrainingArguments (default 1.0), so no new config field.
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)  # ty: ignore[unresolved-attribute]
             # self.optimizer is Optional on Trainer's base class for the same reason noted
             # above this method's self.optimizer.zero_grad() call; still provably a real
             # Optimizer at this point in the loop.
@@ -755,6 +1276,91 @@ class MTPPOTrainer(Trainer):
         # type), each with a genuine .save_pretrained() that handles tied weights correctly.
         self.model.policy.save_pretrained(output_path / "policy")  # ty: ignore[call-non-callable, unresolved-attribute]
         self.model.critic.save_pretrained(output_path / "critic")  # ty: ignore[call-non-callable, unresolved-attribute]
+
+    def _save_full_checkpoint(self, output_dir: str) -> None:
+        """Save everything needed to resume training exactly where it left off: policy+critic
+        weights (via _save_policy_and_critic, which already correctly handles Qwen3.5's tied
+        lm_head/embed_tokens weights), plus optimizer/RNG/step state via transformers.Trainer's
+        own inherited primitives -- the same ones TRL's own PPOTrainer relies on (PPOConfig
+        subclasses TrainingArguments directly and exposes resume_from_checkpoint/save_steps,
+        confirmed against trl==1.9.0). Not unit-tested: _save_optimizer_and_scheduler and
+        _save_rng_state are inherited, untouched Trainer methods that write real optimizer
+        state/RNG snapshots to disk -- validated by Task 7's live smoke test instead. See
+        docs/superpowers/specs/2026-07-23-phase-7b-full-ppo-runs-design.md.
+
+        Ends by calling transformers' own rotate_checkpoints (the same disk-retention function
+        Trainer's built-in _save_checkpoint uses) to delete older checkpoint-N directories beyond
+        self.args.save_total_limit -- a full checkpoint here (weights+optimizer+RNG) is far larger
+        than the weights-only ~3GB this repo has measured so far (AdamW's two per-parameter
+        moment buffers, same bf16 dtype as the params, roughly double each model's own memory),
+        so leaving every checkpoint on disk for a 500-step run would exhaust this machine's disk
+        -- not a hypothetical, confirmed by direct calculation before this method was written this
+        way. rotate_checkpoints always protects the most-recent checkpoint (needed for resume),
+        so this never deletes the one train()'s own resume path would need.
+        """
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        self._save_policy_and_critic(output_dir)
+        # Live smoke testing saw a 6/7 CUDA OOM rate this session, with most failures landing at
+        # or near a checkpoint-save step boundary -- but the raw tracebacks never actually showed
+        # the save call itself in the stack (see docs/phase-7b-full-ppo-runs.md's "honest caveat"
+        # for the specific step-offset counterexamples), so treat the boundary correlation as a
+        # plausible, re-test-confirmed contributing factor, not a fully nailed-down root cause.
+        # What IS confirmed via direct transformers==5.13.0 source inspection: in this repo's
+        # single-GPU config, Trainer._save_optimizer_and_scheduler calls
+        # torch.save(self.optimizer.state_dict(), ...) directly on GPU-resident optimizer tensors
+        # (AdamW's exp_avg/exp_avg_sq) with no CPU transfer first -- a documented PyTorch/HF
+        # community OOM trigger when GPU memory is already this tight (~92-94% utilized here).
+        # Freeing cached (allocated-but-unused) blocks before that save gives it room without
+        # touching any hyperparameter, gradient, or model output; re-tested once, it took mt_ppo's
+        # regression check from 4/4 failures to 1/1 success -- real signal, but only one data
+        # point so far.
+        torch.cuda.empty_cache()
+        self._save_optimizer_and_scheduler(output_dir)
+        self._save_rng_state(output_dir)
+        self.state.save_to_json(str(Path(output_dir) / "trainer_state.json"))
+        rotate_checkpoints(
+            output_dir=str(Path(output_dir).parent),
+            save_total_limit=self.args.save_total_limit,
+            use_mtime=False,
+        )
+
+    def _load_full_checkpoint(self, checkpoint_dir: str) -> None:
+        """Inverse of _save_full_checkpoint -- reloads policy+critic weights, optimizer/RNG
+        state, and global_step, so train() can resume exactly where a prior run left off. Not
+        unit-tested: loads real weights and real optimizer/RNG state from disk -- validated by
+        Task 7's live smoke test instead, same convention as build_policy_and_critic.
+
+        Loads weights INTO the existing self.model.policy/self.model.critic objects via
+        load_state_dict, rather than replacing those objects outright -- a real bug a code
+        reviewer caught: train() calls self.optimizer = self.create_optimizer() (which binds
+        AdamW's param groups to the *specific tensor objects* of
+        self.model.policy.parameters()/self.model.critic.parameters() at that moment) BEFORE this
+        method runs. Reassigning self.model.policy/.critic to brand-new model objects loaded from
+        the checkpoint would silently orphan the optimizer's param-group references -- forward/
+        backward would then populate .grad on the NEW model's parameters, but optimizer.step()
+        would only ever update the old, now-untethered tensors nothing else reads from. No
+        exception, just a resumed run that silently stops learning. load_state_dict instead
+        copies the checkpoint's tensor values into the existing parameter tensors in place, so the
+        optimizer's existing references stay valid -- no reordering relative to create_optimizer()
+        is needed, and no rebuilding of gradient_checkpointing_enable() either (already enabled on
+        the existing self.model.policy/.critic by build_policy_and_critic).
+        """
+        policy_checkpoint = AutoModelForCausalLM.from_pretrained(
+            str(Path(checkpoint_dir) / "policy"), dtype=torch.bfloat16
+        )
+        critic_checkpoint = AutoModelForSequenceClassification.from_pretrained(
+            str(Path(checkpoint_dir) / "critic"), num_labels=1, dtype=torch.bfloat16
+        )
+        # self.model.policy/.critic are real PreTrainedModel instances at runtime (see
+        # create_optimizer's comment for why ty can't see this through Trainer's loose self.model
+        # type), each with a genuine .load_state_dict() that copies tensor values in place
+        # (handling any cross-device copy automatically), leaving the parameter objects
+        # themselves -- and every other reference to them, including the optimizer's -- intact.
+        self.model.policy.load_state_dict(policy_checkpoint.state_dict())  # ty: ignore[unresolved-attribute]
+        self.model.critic.load_state_dict(critic_checkpoint.state_dict())  # ty: ignore[unresolved-attribute]
+        self._load_optimizer_and_scheduler(checkpoint_dir)
+        self._load_rng_state(checkpoint_dir)
+        self.state = TrainerState.load_from_json(str(Path(checkpoint_dir) / "trainer_state.json"))
 
     # train(self) intentionally narrows Trainer.train's full signature
     # (resume_from_checkpoint, trial, ignore_keys_for_eval -> TrainOutput) down to train(self)
@@ -788,13 +1394,22 @@ class MTPPOTrainer(Trainer):
         """
         set_seed(self.args.seed)
         self.optimizer = self.create_optimizer()
+        if self.args.resume_from_checkpoint:
+            self._load_full_checkpoint(self.args.resume_from_checkpoint)
+        collapse_monitor = CollapseMonitor()
         # self.train_dataset is typed by Trainer's base class as
         # `torch.utils.data.Dataset | datasets.arrow_dataset.Dataset | None`, and
         # torch.utils.data.Dataset's stub doesn't declare __iter__, so ty can't confirm it's
         # Iterable -- but build_ppo_trainer (Task 11) always constructs this trainer with a real
-        # datasets.Dataset, which genuinely is iterable at runtime.
+        # datasets.Dataset, which genuinely is iterable at runtime. The same untyped-Dataset root
+        # cause is why ty can't confirm the resulting list is `list[dict]` either, needed by
+        # _row_cycle_from_step's signature below.
         rows = list(self.train_dataset)  # ty: ignore[invalid-argument-type]
-        row_cycle = itertools.cycle(rows)
+        row_cycle = _row_cycle_from_step(
+            rows,  # ty: ignore[invalid-argument-type]
+            self.state.global_step,
+            self.args.num_rollouts_per_step,  # ty: ignore[unresolved-attribute]
+        )
         trackio.init(project=self.args.project, name=self.args.run_name)
 
         # self.args.output_dir is typed `str | None` on TrainingArguments (None only if a
@@ -806,8 +1421,15 @@ class MTPPOTrainer(Trainer):
         sample_completions_path = output_dir / "sample_completions.log"
 
         run_start = time.monotonic()
-        for step in range(self.args.max_steps):
+        for step in range(self.state.global_step, self.args.max_steps):
             step_start = time.monotonic()
+            # Reset here (not once at the top of train()) so max_memory_allocated below reflects
+            # THIS step's own peak, not a running max across the whole training run -- added
+            # after real live diagnosis needed exception-message archaeology (parsing "X GiB
+            # allocated" out of a caught OOM's str()) to answer "is memory actually growing over
+            # time, or just persistently tight?" Real per-step numbers make that a direct read
+            # instead of a reconstruction.
+            torch.cuda.reset_peak_memory_stats()
             # self.args.num_rollouts_per_step is a real field on this file's MTPPOConfig, but
             # Trainer's base type stub only knows self.args as the looser `TrainingArguments` --
             # same ty-can't-see-through-Trainer's-base-types root cause already noted throughout
@@ -817,8 +1439,83 @@ class MTPPOTrainer(Trainer):
                 next(row_cycle)
                 for _ in range(self.args.num_rollouts_per_step)  # ty: ignore[unresolved-attribute]
             ]
-            episodes = self._collect_batch(batch_rows)
-            update_metrics = self._ppo_update(episodes)
+            # Found live during Phase 7b's first full-scale run: a genuinely long episode (one
+            # observed at 2302 action tokens, ~2-20x this run's typical length) can leave the CUDA
+            # allocator fragmented enough after its own forward/backward passes that a later
+            # step's ordinary-length episode then OOMs -- deterministically reproducible on every
+            # --resume-from-checkpoint replay of the same data order, since the same oversized
+            # episode recurs at the same step every time (confirmed live: three consecutive
+            # resume attempts died at the identical point with byte-identical OOM diagnostics).
+            # Researched real-world practice before choosing a fix (not guessed): the standard
+            # PyTorch pattern for a per-batch OOM is catch, empty_cache, and move to the next
+            # batch rather than crash the whole process (e.g. PyTorch Forums/Databricks
+            # community threads on this exact error), and veRL (the framework Search-R1 -- the
+            # lineage this repo's own design already builds on -- is itself built on) ships a
+            # real `filter_overlong_prompts` feature with the same underlying philosophy: don't
+            # let one outlier-length example take down an entire training step. This step
+            # therefore catches a CUDA OOM at the per-step level, logs it as a real (not hidden)
+            # skipped step, and continues -- rather than crashing the whole process and forcing a
+            # resume (which pays a full model-reload cost and, per the finding above, can walk
+            # right back into the identical failure on a deterministic replay anyway).
+            #
+            # Known, accepted limitation: _ppo_update runs args.num_ppo_epochs inner epochs, each
+            # ending in a real optimizer.step() -- if the OOM happens partway through (e.g. epoch
+            # 3 of 4), the epochs that already completed have already applied real weight updates
+            # that are NOT rolled back just because this step is logged as "skipped". This is a
+            # deliberate simplicity tradeoff, not an oversight: a fully atomic per-step rollback
+            # would need to snapshot and restore optimizer/model state before every step, adding
+            # real overhead to every single step to guard against an occasional partial failure.
+            failed_at = None
+            try:
+                failed_at = "_collect_batch"
+                episodes = self._collect_batch(batch_rows)
+                failed_at = "_ppo_update"
+                update_metrics = self._ppo_update(episodes)
+                failed_at = None
+            except RuntimeError as exc:
+                # Catches both torch's own torch.OutOfMemoryError (a RuntimeError subclass) and
+                # Triton kernels' plain `RuntimeError: Triton Error [CUDA]: out of memory` (a
+                # real, separately-observed failure site in this repo's own live testing, not the
+                # same exception class as torch's) -- re-raise anything whose message doesn't
+                # actually say "out of memory", so a genuinely different bug still surfaces as a
+                # visible crash instead of being silently absorbed here.
+                if "out of memory" not in str(exc).lower():
+                    raise
+                gpu_stats = {
+                    "gpu_allocated_gb": torch.cuda.memory_allocated() / 1e9,
+                    "gpu_reserved_gb": torch.cuda.memory_reserved() / 1e9,
+                    "gpu_max_allocated_gb": torch.cuda.max_memory_allocated() / 1e9,
+                }
+                torch.cuda.empty_cache()
+                skip_record = {
+                    "step": step,
+                    "skipped": True,
+                    "failed_at": failed_at,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "questions_attempted": [row["question"] for row in batch_rows],
+                    **gpu_stats,
+                }
+                with log_path.open("a") as log_file:
+                    log_file.write(json.dumps(skip_record) + "\n")
+                print(
+                    f"step {step + 1}/{self.args.max_steps} | SKIPPED (CUDA OOM in {failed_at}) "
+                    f"-- allocated={gpu_stats['gpu_allocated_gb']:.2f}GB "
+                    f"peak={gpu_stats['gpu_max_allocated_gb']:.2f}GB -- see train_log.jsonl for "
+                    f"the questions attempted",
+                    flush=True,
+                )
+                # Skips must reach trackio too, or the dashboard silently under-reports how much
+                # of a run actually happened -- and an asymmetric skip rate between arms is the
+                # confound that invalidated Phase 7b (mt_ppo took 431 real updates to ppo's 499).
+                trackio.log({"step": step, "skipped": 1.0, **gpu_stats})
+                self.state.global_step = step + 1
+                continue
+            gpu_stats = {
+                "gpu_allocated_gb": torch.cuda.memory_allocated() / 1e9,
+                "gpu_reserved_gb": torch.cuda.memory_reserved() / 1e9,
+                "gpu_max_allocated_gb": torch.cuda.max_memory_allocated() / 1e9,
+            }
+            torch.cuda.empty_cache()
 
             mean_reward = sum(e["format_and_outcome_reward"] for e in episodes) / len(episodes)
             mean_retrieval_fraction = sum(e["retrieval_fraction"] for e in episodes) / len(episodes)
@@ -832,10 +1529,61 @@ class MTPPOTrainer(Trainer):
                 "policy_loss": update_metrics["policy_loss"],
                 "value_loss": update_metrics["value_loss"],
                 "kl": update_metrics["kl"],
+                "ratio_mean": update_metrics["ratio_mean"],
+                "ratio_variance": update_metrics["ratio_variance"],
+                "clip_fraction": update_metrics["clip_fraction"],
                 "reward": mean_reward,
                 "retrieval_fraction": mean_retrieval_fraction,
+                # The four metrics this phase is actually judged on. All were previously
+                # computed (or logged to train_log.jsonl) but never reached trackio, so the
+                # dashboard could not answer the questions that matter most:
+                #   format_compliance -- the anchor. The paper reports 0.998 on HotpotQA; this
+                #     repo's pre-fix runs sat near 0.48. It was already being computed for
+                #     CollapseMonitor and then discarded.
+                #   ended_on_tool_rate -- must stay 0.0. Nonzero means the answer-turn defect
+                #     has regressed and episodes are being penalised for a turn they never got.
+                #   mean_tool_turns -- the search penalty's observable effect; uncontrolled
+                #     growth here is what preceded the earlier OOM cascade.
+                #   skipped -- 0.0/1.0 per step, so the dashboard shows the skip RATE. Skips
+                #     differing between arms is the confound that invalidated Phase 7b.
+                "format_compliance": sum(e["format_reward"] for e in episodes) / len(episodes),
+                "ended_on_tool_rate": sum(
+                    1.0
+                    for e in episodes
+                    if e["completion"] and e["completion"][-1].get("role") == "tool"
+                )
+                / len(episodes),
+                "mean_tool_turns": sum(len(e["turn_boundary_action_indices"]) for e in episodes)
+                / len(episodes),
+                "skipped": 0.0,
+                **gpu_stats,
             }
             trackio.log(metrics)
+
+            mean_format_reward = sum(e["format_reward"] for e in episodes) / len(episodes)
+            for alert in collapse_monitor.check(
+                step=step,
+                loss=metrics["loss"],
+                mean_reward=mean_reward,
+                mean_format_reward=mean_format_reward,
+            ):
+                trackio.alert(
+                    title=alert.title,
+                    text=alert.text,
+                    level=trackio.AlertLevel.ERROR
+                    if alert.level == "ERROR"
+                    else trackio.AlertLevel.WARN,
+                )
+                if alert.should_stop:
+                    # Set global_step before saving -- this branch runs before the loop's own
+                    # `self.state.global_step = step + 1` line below, so without this, the saved
+                    # trainer_state.json would record a stale (one-step-behind) global_step,
+                    # off by one from this checkpoint directory's own `checkpoint-{step + 1}`
+                    # name.
+                    self.state.global_step = step + 1
+                    self._save_full_checkpoint(f"{self.args.output_dir}/checkpoint-{step + 1}")
+                    print(f"Stopping training early at step {step + 1}: {alert.title}", flush=True)
+                    return
 
             log_record = dict(metrics)
             log_record["step_elapsed_seconds"] = time.monotonic() - step_start
@@ -847,6 +1595,21 @@ class MTPPOTrainer(Trainer):
                     "format_and_outcome_reward": episode["format_and_outcome_reward"],
                     "retrieval_fraction": episode["retrieval_fraction"],
                     "num_action_tokens": len(episode["old_values"]),
+                    # Turn accounting, logged because reconstructing it from the 1-in-10
+                    # sampled transcripts was not enough to measure the 2026-07-26 answer-turn
+                    # defect -- where an episode that used its whole tool budget ended on a
+                    # role:tool message with no generation left in which to answer, and was then
+                    # penalised for not answering. ended_on_tool must now be False for every
+                    # episode; a nonzero rate means that regression is back.
+                    # The format-compliance anchor (paper: 0.998 on HotpotQA), logged
+                    # explicitly because it is NOT derivable from format_and_outcome_reward
+                    # for the ppo arm: PPO-OR's reward is binary correctness with no format
+                    # term, so 0.0 means "wrong answer" OR "no answer" indistinguishably.
+                    "format_ok": episode["format_reward"],
+                    "num_tool_turns": len(episode["turn_boundary_action_indices"]),
+                    "ended_on_tool": episode["completion"][-1].get("role") == "tool"
+                    if episode["completion"]
+                    else False,
                 }
                 for episode in episodes
             ]
@@ -875,10 +1638,10 @@ class MTPPOTrainer(Trainer):
 
             self.state.global_step = step + 1
 
-            if (step + 1) % self.args.save_steps == 0 if self.args.save_steps else False:
-                self._save_policy_and_critic(f"{self.args.output_dir}/checkpoint-{step + 1}")
+            if (step + 1) % self.args.save_steps == 0:
+                self._save_full_checkpoint(f"{self.args.output_dir}/checkpoint-{step + 1}")
 
-        self._save_policy_and_critic(f"{self.args.output_dir}/checkpoint-{self.args.max_steps}")
+        self._save_full_checkpoint(f"{self.args.output_dir}/checkpoint-{self.args.max_steps}")
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -889,12 +1652,171 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train multi-turn PPO/MT-PPO (see CLAUDE.md and docs/phase-7-mt-ppo.md)."
     )
-    parser.add_argument("--condition", required=True, choices=["ppo", "mt_ppo"])
+    parser.add_argument(
+        "--condition", required=True, choices=["ppo", "ppo_mr", "ppo_mr_paper", "mt_ppo"]
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-size", type=int, default=8)
     parser.add_argument("--max-steps", type=int, default=2)
     parser.add_argument("--num-rollouts-per-step", type=int, default=2)
+    parser.add_argument("--save-steps", type=int, default=50)
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        default=None,
+        help="Path to a checkpoint-N directory to resume from, or 'auto' to resume from the "
+        "latest checkpoint under this run's output_dir.",
+    )
     return parser.parse_args(argv)
+
+
+def normalize_advantages(advantages: list[float]) -> list[float]:
+    """Rescale advantages to zero mean and unit variance.
+
+    Standard PPO practice, and not optional here: this repo takes policy_lr=1e-6 directly from
+    the paper's Appendix C.1.3, but the paper runs on veRL, which normalizes advantages by
+    default. A learning rate calibrated for unit-scale advantages applied to raw ones -- here
+    typically ~0.1-0.3, because most episodes score the -0.1 format floor and gamma=lambda=1
+    makes every token's advantage R_total - V(t) -- yields an effective step size several times
+    smaller than the paper's. Copying the hyperparameter without its precondition is what made
+    the two incomparable.
+
+    Rescales only; it never reorders. The relative ranking of actions IS the learning signal, so
+    a transform that changed it would change the algorithm rather than its conditioning.
+
+    Zero variance returns all-zero rather than dividing by ~0. That state is real, not
+    hypothetical -- it is exactly what the 2026-07-24 flat-reward bug produced for 177 steps --
+    and NaN advantages would poison every subsequent update rather than simply carrying no
+    signal, which is the honest representation of a batch in which nothing differed.
+    """
+    count = len(advantages)
+    mean = sum(advantages) / count
+    variance = sum((a - mean) ** 2 for a in advantages) / count
+    std = math.sqrt(variance)
+    if std < 1e-8:
+        return [0.0] * count
+    return [(a - mean) / std for a in advantages]
+
+
+def gather_action_logprobs(lm_head, hidden_states, next_tokens, chunk_size=LOGPROB_CHUNK_SIZE):
+    """Log-prob of each next_token, applying lm_head in gradient-checkpointed chunks.
+
+    Purely a memory optimisation -- mathematically this is just
+    `log_softmax(lm_head(hidden_states)).gather(...)`, since each position's log_softmax is taken
+    over its own vocab row and is independent of every other position.
+
+    Agreement is numerical, not bit-exact, and the distinction is worth stating precisely: a
+    [chunk, hidden] x [hidden, vocab] matmul can select a different GEMM kernel than the
+    full-height one, so lm_head's output shifts by roughly one ULP (measured: 4.77e-07 in
+    float32; exactly 0 when one chunk covers every position; ~1e-3 relative in bf16, the same
+    caveat Liger-Kernel documents for its own chunked kernels). tests/unit/test_train_ppo.py
+    pins values and gradients to a tolerance just above that, at chunk sizes that do and do not
+    divide the position count.
+
+    Why it is needed (measured on this repo's own RTX 4090, not assumed). Phase 7 already cut
+    the vocab-sized tensor from O(seq_len * vocab) to O(num_action_tokens * vocab) by applying
+    lm_head only at action positions. But with a 248,320-token vocab that residual term is still
+    the only part of the update that GROWS WITH EPISODE LENGTH -- and mt_ppo's episodes triple in
+    length during training (386 -> ~1190 action tokens) as its turn reward teaches the policy to
+    search more. Measured peak for this path alone:
+
+        num_action_tokens:   1200      3000
+        one pass:           2.32 GB   5.02 GB
+        chunked (256):      0.92 GB   0.94 GB      <- flat, at the lm_head-weight floor
+
+    That growth is what drove mt_ppo's 13.8% CUDA-OOM step-skip rate (69 of 500 steps, every one
+    of them inside _ppo_update, never in rollout, all peaking at 23.6-24.2 GB against a ~23.5 GB
+    card) while ppo -- whose episodes stay short -- skipped 0.2%. An asymmetric skip rate between
+    the two conditions is a methodology problem, not just lost throughput: it silently gives the
+    two arms of the comparison different numbers of real gradient updates (431 vs 499).
+
+    torch.utils.checkpoint drops each chunk's [chunk_size, vocab] logits after the forward pass
+    and recomputes them during backward, trading one extra lm_head matmul per chunk for a peak
+    that no longer depends on episode length.
+
+    Liger-Kernel's LigerFusedLinearPPOLoss was evaluated first and deliberately not used: it
+    computes the whole PPO objective (it takes advantages/old_per_token_logps/epsilon/beta and a
+    loss_type selector), so adopting it would replace this repo's paper-faithful compute_ppo_loss
+    and its clip-fraction/ratio diagnostics -- a different algorithm, not a memory optimisation.
+    """
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+    def head(states, targets):
+        log_probs = torch.log_softmax(lm_head(states), dim=-1)
+        return log_probs.gather(1, targets.unsqueeze(-1)).squeeze(-1)
+
+    chunks = [
+        checkpoint(
+            head,
+            hidden_states[start : start + chunk_size],
+            next_tokens[start : start + chunk_size],
+            use_reentrant=False,
+        )
+        for start in range(0, hidden_states.shape[0], chunk_size)
+    ]
+    return torch.cat(chunks)
+
+
+def validate_tool_call_arguments(tool, call_args: dict) -> str | None:
+    """Return an error message if call_args is not a valid call to `tool`, else None.
+
+    Checks names/arity via inspect binding AND argument types against the tool's annotations.
+    The type half is what a plain bind() misses, and it is load-bearing: Python does not enforce
+    annotations, so `search(query=123)` binds perfectly happily and only fails later, out at the
+    retrieval server, as `HTTP 422 Unprocessable Content` -- which took down a 500-step run at
+    step 166 on 2026-07-24. The policy had emitted a non-string query, which the chat template's
+    json value parser (allow_non_json) faithfully passed through as an int.
+
+    A wrongly-TYPED argument is the same class of model mistake as a wrongly-NAMED one -- exactly
+    the kind of thing the episode's own format/outcome reward should teach the policy out of --
+    so it belongs here, returned as feedback to the model, rather than propagating as a crash.
+    That keeps _rollout_episode's deliberate split intact: everything raised from inside search()
+    itself still surfaces as a real infra failure and is never swallowed.
+
+    Only simple type annotations are enforced. A parameter annotated with anything else (or not
+    annotated at all) is left alone rather than guessed at -- a validator that rejects calls the
+    server would have served fine is worse than no validator.
+    """
+    try:
+        bound = inspect.signature(tool).bind(**call_args)
+    except TypeError as exc:
+        return f"invalid arguments for {tool.__name__}(): {exc}"
+
+    parameters = inspect.signature(tool).parameters
+    for name, value in bound.arguments.items():
+        annotation = parameters[name].annotation
+        if not isinstance(annotation, type) or annotation is inspect.Parameter.empty:
+            continue
+        if not isinstance(value, annotation):
+            return (
+                f"invalid arguments for {tool.__name__}(): argument '{name}' must be "
+                f"{annotation.__name__}, got {type(value).__name__} ({value!r})"
+            )
+    return None
+
+
+def resolve_auto_checkpoint(output_dir: str | None) -> str:
+    """Resolve `--resume-from-checkpoint auto` to the latest checkpoint under output_dir.
+
+    Raises rather than silently starting from scratch: `auto` means "continue the run I already
+    have", so a missing checkpoint is a mistake worth stopping on, not a reason to quietly begin
+    a fresh 500-step run under the same output_dir (which would interleave a new run's logs and
+    checkpoints with the old ones).
+
+    An output_dir that does not exist at all (or is None, which TrainingArguments permits) is the
+    same "nothing to resume" case, but transformers' get_last_checkpoint raises FileNotFoundError
+    from os.listdir before it can return None -- so a first launch with `auto` died on an opaque
+    traceback from library internals instead of this module's own message. Normalised here.
+    """
+    last_checkpoint = (
+        get_last_checkpoint(output_dir) if output_dir and os.path.isdir(output_dir) else None
+    )
+    if last_checkpoint is None:
+        raise ValueError(
+            f"--resume-from-checkpoint auto: no checkpoint found under {output_dir}. "
+            "Omit the flag entirely to start a fresh run."
+        )
+    return last_checkpoint
 
 
 def build_ppo_trainer(
@@ -910,6 +1832,27 @@ def build_ppo_trainer(
 
     from turn_level_rewards import data
 
+    # Seed BEFORE building the model, not only inside train(). The critic is created by
+    # AutoModelForSequenceClassification.from_pretrained, whose score.weight has no pretrained
+    # values and is randomly initialized ("score.weight | MISSING | newly initialized" in the
+    # startup log). MTPPOTrainer.train() calls set_seed(self.args.seed), but that runs long after
+    # this line, so the critic head was outside --seed's control entirely: two runs at the same
+    # seed got different critics.
+    #
+    # Confirmed empirically, not inferred -- building the critic twice without seeding gives
+    # score.weight [0.026378, 0.000129, ...] then [0.053903, -0.003120, ...]; seeding first gives
+    # identical values both times. It also matches what the runs showed: step 0 with an identical
+    # prompt produced identical reward and retrieval_fraction (policy rollouts happen after
+    # set_seed, so they were controlled) but different loss (14.16 vs 9.78, purely the critic),
+    # and the runs diverged from step 1 onward.
+    #
+    # This invalidates the Phase 7 handoff claim, quoted in CLAUDE.md, that same-seed runs
+    # "reproduce exactly" -- that held only for the metrics that happened to be seeded.
+    #
+    # It matters most for exactly the comparison this repo is trying to make: the paper's
+    # MT-PPO-over-PPO-MR effect is +1.7 EM points and already marginal at one seed, so an
+    # uncontrolled noise source that --seed does not pin is precisely what could swamp it.
+    set_seed(config.seed)
     model = build_policy_and_critic(MODEL_NAME)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     train_dataset = data.load_train_dataset(n=train_size, seed=config.seed)
@@ -929,10 +1872,15 @@ def main() -> None:
         seed=args.seed,
         max_steps=args.max_steps,
         num_rollouts_per_step=args.num_rollouts_per_step,
+        save_steps=args.save_steps,
     )
     config.run_name = (
         f"{args.condition}-{args.max_steps}steps-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     )
+    resume_from_checkpoint = args.resume_from_checkpoint
+    if resume_from_checkpoint == "auto":
+        resume_from_checkpoint = resolve_auto_checkpoint(config.output_dir)
+    config.resume_from_checkpoint = resume_from_checkpoint
     trainer = build_ppo_trainer(args.condition, args.train_size, config)
     trainer.train()
 

@@ -1,50 +1,76 @@
-# Phase 8b: Full judge-augmented training runs + evaluation + comparison
+# Phase 8b: Judge vs. partial credit — does an expensive judge beat a cheap graded metric?
 
-## Goal
+**Status**: not started. **Prerequisite: Phase 8** (judge built and smoke-tested) **and Phase 7c**
+(the five-arm deterministic comparison).
 
-Run full training with the LLM-judge reward wired in (built in Phase 8), evaluate, and produce a
-final comparison against Phase 7b's deterministic-reward `ppo`/`mt_ppo` results — closing the same
-gap for the judge track that 7b closes for the deterministic track (see CLAUDE.md's Roadmap
-section, 2026-07-23 addendum).
+**This is the phase with an original contribution in it**, rather than a reproduction.
 
-**This doc is intentionally a thin stub.** Its concrete task list depends on decisions and
-measurements that don't exist yet: Phase 8's chosen judge-combination formula, the real observed
-judge latency/cost per rollout, and the 20b-vs-120b judge-quality validation result. Flesh this
-out for real once Phase 8 lands — don't treat the placeholder tasks below as final.
+## The question
 
-## Read first
+The paper motivates its LLM judge with a specific limitation of verifiable rewards
+(Section 5.3, verbatim):
 
-Phase 8's Handoff notes (`docs/phase-8-llm-judge.md`) — the combination formula actually chosen,
-real cost/latency numbers, and any Bedrock API surprises. Phase 7b's Handoff notes
-(`docs/phase-7b-full-ppo-runs.md`) — the eval-path design and chart system built there should be
-reused here, not rebuilt.
+> *"Verifiable rewards, such as exact match, provide a strict and objective form of evaluation.
+> However, they can be overly rigid: an agent may produce a correct answer that differs slightly
+> in form from the ground truth but still receives negative feedback."*
 
-## Prerequisites (entry state)
+**This repo independently reached the same diagnosis and treated it differently.** The F1 + 0.5·EM
+outcome reward (`rewards.outcome_reward`, Phases 2-6) exists precisely because binary exact match
+is too rigid — the same problem, patched with a cheap graded metric rather than an expensive
+model. That deviation was originally an unvalidated shortcut (see `CLAUDE.md`), but it turns out
+to address a limitation the paper's own authors identified.
 
-- Phase 8 done: judge reward wired in, smoke-tested against the real Bedrock endpoint, per
-  `docs/phase-8-llm-judge.md`'s exit criteria (including its cost-per-run estimate).
+**Nobody has compared the two treatments.** The paper proposes the judge and never benchmarks it.
 
-## Tasks (placeholder — confirm/replace once Phase 8's real numbers exist)
+## The experiment
 
-- [ ] Before committing to a full run: check Phase 8's recorded cost estimate against the actual
-      budget for this run (500 rollout-collection steps, both conditions) — this is a real-money
-      decision (Bedrock inference), not a free compute choice like the deterministic runs. Flag to
-      the user for confirmation before spending it, per this repo's general "confirm before costly
-      irreversible actions" norm.
-- [ ] Full training runs, both judge-augmented conditions, mirroring 7b's structure.
-- [ ] Held-out evaluation, reusing 7b's eval-path design.
-- [ ] Comparison write-up: judge-augmented vs. deterministic-reward results, using 7b's matplotlib
-      visual system for consistency (not a new chart style).
+Three MT-PPO arms, identical except for how the outcome reward handles EM's rigidity:
 
-## Exit criteria (all must be true before handing off)
+| Arm | Outcome reward | Source | Already exists? |
+|---|---|---|---|
+| `baseline` | Binary EM (+1.0 / +0.2 / −1.0) | The paper's Table 2 | **Yes** — Phase 7c's `mt_ppo` |
+| `judge` | LLM-as-judge scoring | The paper's Section 5.3 | Phase 8 |
+| `partial_credit` | F1-graded outcome | This repo | **Yes** — `rewards.outcome_reward` |
 
-- [ ] Both judge-augmented conditions trained to completion within a confirmed budget.
-- [ ] Held-out evaluation completed.
-- [ ] Comparison against Phase 7b's deterministic results recorded, using the shared chart system.
+Two of three already exist, so the marginal cost is one arm plus evaluation.
 
-## Handoff notes
+## Methodological trap — design around it, do not discover it
 
-<!-- Fill in after completing this phase. Leave this section for the next fresh agent to read
-first. -->
+Each arm optimizes a different objective, so **the evaluation metric must not favour one by
+construction**:
 
-(not yet started)
+- Scoring on F1 advantages `partial_credit` (it optimizes F1 directly)
+- Scoring on judge output advantages `judge`
+- Scoring on EM advantages `baseline`
+
+**Use held-out exact match.** It is the paper's own reported metric, and it disadvantages the two
+treatments — which is what makes a win meaningful. If `judge` or `partial_credit` beats
+`baseline` **on EM despite not optimizing EM directly**, that is a real result rather than a
+tautology. State this reasoning in the write-up; it is the difference between a finding and a
+rigged comparison.
+
+Report F1 alongside EM for completeness, clearly labelled as favouring one arm.
+
+## Also measure, do not merely note
+
+- **Cost and latency**: a judge call per turn per rollout, inside the training loop. Record
+  wall-clock and spend against the deterministic arms. If the judge wins but costs 10x, that is
+  part of the result.
+- **Reward hacking**: a policy optimizing against a model's opinion can learn to produce text the
+  judge scores well without being more correct — a failure mode a deterministic check cannot have.
+  Watch for judge reward rising while held-out EM stalls or falls. That divergence is itself a
+  reportable finding.
+
+## Exit criteria
+
+- Three arms trained and evaluated on held-out EM, same seed, same eval size
+- Cost/latency recorded per arm
+- An explicit statement of whether the judge justified its cost over F1 partial credit
+- Handoff notes filled in; `CLAUDE.md` roadmap Status updated
+
+## Honest framing for the write-up
+
+This is a small, single-seed experiment on one dataset with a batch size far below the paper's.
+It cannot settle the question in general. What it can do is provide the first direct comparison of
+two treatments for a problem the paper itself named — and if the cheap one holds up, that is worth
+saying plainly, with its limitations stated just as plainly.

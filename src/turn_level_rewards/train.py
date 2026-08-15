@@ -16,9 +16,14 @@ from trl import GRPOConfig, GRPOTrainer
 
 from turn_level_rewards import data
 from turn_level_rewards.env import SearchEnv
-from turn_level_rewards.rewards import get_reward_funcs
+from turn_level_rewards.rewards import get_paper_reward_funcs, get_reward_funcs
 
-Condition = Literal["outcome_only", "turn_level"]
+# outcome_only/turn_level use THIS REPO's reward design (Phases 5-6, a completed and
+# held-out-confirmed experiment). grpo_or/grpo_mr use the PAPER's reward design (Section 6.1),
+# added so the GRPO arms can join the PPO arms in one five-arm Table 2 comparison -- holding
+# the reward fixed across algorithms is what makes that comparison valid. The original two are
+# kept rather than redefined, so existing written-up results stay meaningful.
+Condition = Literal["outcome_only", "turn_level", "grpo_or", "grpo_mr"]
 
 # TRL's _get_per_token_logps_and_entropies chunks its forward pass using per_device_train_batch_size
 # as the literal chunk size (grpo_trainer.py:2089) -- a real canary run at num_generations=21 with
@@ -97,6 +102,21 @@ def build_config(
         gradient_accumulation_steps=num_generations // train_micro_batch_size,
         max_tool_calling_iterations=4,
         beta=0.0,
+        # 8-bit AdamW optimizer states, matching the PPO track (train_ppo.py's
+        # use_8bit_optimizer). Two reasons, both load-bearing:
+        #
+        # Consistency: having the PPO arms on 8-bit and the GRPO arms on fp32 would be another
+        # silent asymmetry between tracks that are supposed to be comparable -- exactly the
+        # class of unexamined difference that cost this project its five-arm comparison once
+        # already.
+        #
+        # Memory: a 100-step verification run at num_generations=8 peaked at 23.3 GB against a
+        # ~23.5 GB card. Unlike MTPPOTrainer, TRL's GRPOTrainer has no catch-OOM-and-skip
+        # path, so an OOM here is a hard crash mid-run rather than a skipped step. beta=0.0
+        # means no reference model, so the optimizer holds state for a single 0.8B policy:
+        # AdamW keeps two fp32 states per parameter (~6.4 GB), quantized to ~1.6 GB here.
+        # Measured on a real 100-step run: peak 23.3 GB -> 19.7 GB.
+        optim="adamw_bnb_8bit",
         max_completion_length=2048,
         logging_steps=1,
         logging_nan_inf_filter=False,
@@ -107,7 +127,15 @@ def build_config(
         save_steps=50,
         save_total_limit=3,
         report_to="trackio",
-        project="turn-level-rewards",
+        # The paper-faithful arms share ONE trackio project with the PPO arms so every arm
+        # overlays in a single dashboard -- that combined view IS the deliverable. The
+        # original outcome_only/turn_level runs stay in their own project so this repo's
+        # earlier, non-paper-reward results are not silently mixed in with the reproduction.
+        project=(
+            "turn-level-rewards-paper"
+            if condition in ("grpo_or", "grpo_mr")
+            else "turn-level-rewards"
+        ),
         run_name=condition,
     )
 
@@ -194,7 +222,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train GRPO with outcome-only or turn-level reward (see CLAUDE.md)."
     )
-    parser.add_argument("--condition", required=True, choices=["outcome_only", "turn_level"])
+    parser.add_argument(
+        "--condition",
+        required=True,
+        choices=["outcome_only", "turn_level", "grpo_or", "grpo_mr"],
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-size", type=int, default=8)
     parser.add_argument("--eval-size", type=int, default=8)
@@ -236,10 +268,14 @@ def build_trainer(
     search_cap_in_prompt = not (paper_search_penalty or remove_search_cap_prompt)
     return GRPOTrainer(
         model="Qwen/Qwen3.5-0.8B",
-        reward_funcs=get_reward_funcs(
-            condition,
-            penalize_length=penalize_length,
-            penalize_search_count=paper_search_penalty,
+        reward_funcs=(
+            get_paper_reward_funcs(condition)
+            if condition in ("grpo_or", "grpo_mr")
+            else get_reward_funcs(
+                condition,
+                penalize_length=penalize_length,
+                penalize_search_count=paper_search_penalty,
+            )
         ),
         args=config,
         train_dataset=data.load_train_dataset(

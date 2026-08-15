@@ -15,9 +15,11 @@ from trl import GRPOConfig, GRPOTrainer
 
 from turn_level_rewards import data
 from turn_level_rewards.env import SearchEnv
-from turn_level_rewards.rewards import get_reward_funcs
+from turn_level_rewards.rewards import get_paper_reward_funcs, get_reward_funcs
 
-Condition = Literal["outcome_only", "turn_level"]
+# grpo_or/grpo_mr are the paper-faithful conditions added in Phase 7c; outcome_only/turn_level
+# are this repo's original reward design (Phases 5-6). Both are evaluable here.
+Condition = Literal["outcome_only", "turn_level", "grpo_or", "grpo_mr"]
 
 
 def build_eval_config(condition: Condition, eval_batch_size: int) -> GRPOConfig:
@@ -43,6 +45,14 @@ def build_eval_config(condition: Condition, eval_batch_size: int) -> GRPOConfig:
         max_tool_calling_iterations=4,
         beta=0.0,
         max_completion_length=2048,
+        # Greedy decoding, matching evaluate_ppo.py. Training must sample -- GRPO in
+        # particular NEEDS sampling, since its advantage comes from variance between
+        # rollouts of the same prompt -- but scoring a fixed checkpoint with temperature-1.0
+        # sampling makes the benchmark itself random: the same checkpoint on the same
+        # held-out set returns a different EM every run. The paper reports single point
+        # estimates, implying deterministic decoding, and this phase is trying to resolve a
+        # +1.7 EM point effect that a second noise source could easily hide.
+        top_k=1,
         report_to="none",
     )
 
@@ -57,7 +67,11 @@ def build_eval_trainer(
     """
     return GRPOTrainer(
         model=checkpoint,
-        reward_funcs=get_reward_funcs(condition),
+        reward_funcs=(
+            get_paper_reward_funcs(condition)
+            if condition in ("grpo_or", "grpo_mr")
+            else get_reward_funcs(condition)
+        ),
         args=config,
         train_dataset=data.load_train_dataset(n=2, seed=42),  # unused filler; .train() never called
         eval_dataset=data.load_eval_dataset(n=eval_size, seed=42),
@@ -76,7 +90,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate a trained checkpoint on the held-out set (see CLAUDE.md)."
     )
-    parser.add_argument("--condition", required=True, choices=["outcome_only", "turn_level"])
+    parser.add_argument(
+        "--condition",
+        required=True,
+        choices=["outcome_only", "turn_level", "grpo_or", "grpo_mr"],
+    )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--eval-batch-size", type=int, default=2)
     parser.add_argument("--eval-size", type=int, default=4)

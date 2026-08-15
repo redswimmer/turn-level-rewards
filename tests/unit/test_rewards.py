@@ -318,3 +318,162 @@ def test_turn_reward_scale_constant_matches_turn_reward_behavior():
     from turn_level_rewards.rewards import TURN_REWARD_SCALE
 
     assert TURN_REWARD_SCALE == 0.4
+
+
+# --- Paper-faithful GRPO rewards (Section 6.1), for the five-arm comparison ---
+
+
+def test_paper_grpo_outcome_reward_is_binary_correctness():
+    """GRPO-OR is defined word-for-word identically to PPO-OR: "a binary signal indicating
+    final-answer correctness". No format term, no partial credit.
+    """
+    from turn_level_rewards.rewards import paper_grpo_outcome_reward
+
+    completions = [
+        [{"role": "assistant", "content": "<answer>Paris</answer>"}],
+        [{"role": "assistant", "content": "<answer>Berlin</answer>"}],
+        [{"role": "tool", "name": "search", "content": "some retrieved text"}],
+    ]
+
+    rewards = paper_grpo_outcome_reward(completions, [["Paris"], ["Paris"], ["Paris"]])
+
+    assert rewards == [1.0, 0.0, 0.0]
+
+
+def test_paper_grpo_merged_reward_adds_retrieval_to_the_graded_outcome():
+    """GRPO-MR combines retrieval correctness with the graded R^O, as ONE trajectory-level
+    scalar -- GRPO has no per-timestep value function, so there is nowhere to place a per-turn
+    reward. That is the structural reason GRPO-MR is the analogue of PPO-MR, not of MT-PPO.
+    """
+    from turn_level_rewards.rewards import paper_grpo_merged_reward
+
+    class _Env:
+        retrieval_fraction = 0.5
+
+    completions = [
+        [{"role": "assistant", "content": "<answer>Paris</answer>"}],
+        [{"role": "tool", "name": "search", "content": "docs"}],
+    ]
+
+    rewards = paper_grpo_merged_reward(
+        completions, [["Paris"], ["Paris"]], environments=[_Env(), _Env()]
+    )
+
+    assert rewards[0] == pytest.approx(1.0 + 0.3 * 0.5)
+    assert rewards[1] == pytest.approx(-1.0 + 0.3 * 0.5)
+
+
+def test_paper_grpo_merged_reward_tolerates_missing_environments():
+    """environments is only supplied when environment_factory is set; a missing one must score
+    retrieval as 0 rather than crash the run.
+    """
+    from turn_level_rewards.rewards import paper_grpo_merged_reward
+
+    rewards = paper_grpo_merged_reward(
+        [[{"role": "assistant", "content": "<answer>Paris</answer>"}]], [["Paris"]]
+    )
+
+    assert rewards == [1.0]
+
+
+def test_get_paper_reward_funcs_selects_one_function_per_condition():
+    from turn_level_rewards.rewards import get_paper_reward_funcs
+
+    assert [f.__name__ for f in get_paper_reward_funcs("grpo_or")] == ["paper_grpo_outcome_reward"]
+    assert [f.__name__ for f in get_paper_reward_funcs("grpo_mr")] == ["paper_grpo_merged_reward"]
+
+
+def test_get_paper_reward_funcs_rejects_an_unknown_condition():
+    from turn_level_rewards.rewards import get_paper_reward_funcs
+
+    with pytest.raises(ValueError, match="unknown paper GRPO condition"):
+        get_paper_reward_funcs("turn_level")  # ty: ignore[invalid-argument-type]
+
+
+def test_paper_grpo_rewards_have_within_group_variance_when_answers_differ():
+    """GRPO's gradient comes ENTIRELY from within-group reward variance. This pins the known
+    risk of the binary reward: a group whose rollouts all miss scores identically, giving zero
+    variance and therefore zero gradient. Watch frac_reward_zero_std during the real runs.
+    """
+    from turn_level_rewards.rewards import paper_grpo_outcome_reward
+
+    all_wrong = paper_grpo_outcome_reward(
+        [[{"role": "assistant", "content": "<answer>Berlin</answer>"}]] * 4, [["Paris"]] * 4
+    )
+    mixed = paper_grpo_outcome_reward(
+        [
+            [{"role": "assistant", "content": "<answer>Paris</answer>"}],
+            [{"role": "assistant", "content": "<answer>Berlin</answer>"}],
+        ],
+        [["Paris"], ["Paris"]],
+    )
+
+    assert len(set(all_wrong)) == 1  # zero variance -> no gradient from this group
+    assert len(set(mixed)) == 2
+
+
+def test_paper_grpo_rewards_log_every_metric_the_comparison_needs():
+    """Both GRPO arms must log the same metric set, or the five-arm table has holes.
+
+    paper_grpo_merged_reward originally logged retrieval_fraction and format_compliance_rate but
+    NOT exact_match -- so the grpo_mr arm would have finished a full 500-step run reporting no
+    exact match at all, the headline metric of the entire comparison. Caught by the eval
+    determinism gate, where grpo_or emitted eval_exact_match and grpo_mr would not have.
+    """
+    from turn_level_rewards.rewards import paper_grpo_merged_reward, paper_grpo_outcome_reward
+
+    class _Env:
+        retrieval_fraction = 0.5
+
+    completions = [[{"role": "assistant", "content": "<answer>Knox County Airport</answer>"}]]
+    golden = [["Knox County Regional Airport"]]
+
+    for reward_fn, kwargs in (
+        (paper_grpo_outcome_reward, {}),
+        (paper_grpo_merged_reward, {"environments": [_Env()]}),
+    ):
+        logged: dict[str, list[float]] = {}
+
+        def record(name: str, value: float, sink: dict = logged) -> None:
+            sink.setdefault(name, []).append(value)
+
+        reward_fn(completions, golden, log_metric=record, **kwargs)
+        assert "exact_match" in logged, f"{reward_fn.__name__} must log exact_match"
+        assert "f1" in logged, f"{reward_fn.__name__} must log f1"
+        assert "format_compliance_rate" in logged, f"{reward_fn.__name__} must log format rate"
+        # A near-miss answer: EM is 0 but F1 is high -- the exact case that makes reporting both
+        # worthwhile, and the rigidity the paper cites as its reason for adding a judge.
+        assert logged["exact_match"] == [0.0]
+        assert logged["f1"][0] == pytest.approx(0.857, abs=0.01)
+
+
+def test_paper_baseline_turn_reward_is_retrieval_only():
+    """The paper's PPO-MR/GRPO-MR baselines take retrieval correctness as their ONLY intermediate
+    reward. The per-turn format bonus and the lambda_s search penalty are MT-PPO's own Section 5.2
+    contribution -- giving them to an MR baseline turns it into a flattened MT-PPO.
+
+    Pinned as a test because this exact confusion made Phase 7c's `ppo_mr` a non-reproduction of
+    the paper's PPO-MR, and the two arms now differ only by which of these functions they call.
+    """
+    from turn_level_rewards.rewards import PAPER_RETRIEVAL_BONUS, paper_baseline_turn_reward
+
+    assert paper_baseline_turn_reward(found_gold=True) == PAPER_RETRIEVAL_BONUS
+    assert paper_baseline_turn_reward(found_gold=False) == 0.0
+
+
+def test_paper_baseline_turn_reward_ignores_format_and_search_count():
+    """Same inputs that move paper_turn_reward must NOT move the baseline variant."""
+    from turn_level_rewards.rewards import paper_baseline_turn_reward, paper_turn_reward
+
+    # paper_turn_reward is sensitive to format and cumulative searches...
+    assert paper_turn_reward(
+        found_gold=True, format_ok=True, cumulative_searches=1
+    ) != paper_turn_reward(found_gold=True, format_ok=False, cumulative_searches=3)
+
+    # ...the baseline has no such terms to be sensitive to, so retrieval alone determines it.
+    assert paper_baseline_turn_reward(found_gold=True) == paper_baseline_turn_reward(
+        found_gold=True
+    )
+    # And it is strictly the retrieval term: never negative, unlike a search-penalised turn.
+    assert paper_baseline_turn_reward(found_gold=False) == 0.0
+    assert paper_turn_reward(found_gold=False, format_ok=False, cumulative_searches=4) < 0.0

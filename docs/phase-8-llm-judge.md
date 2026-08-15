@@ -1,5 +1,21 @@
 # Phase 8: LLM-as-Judge Reward (Bedrock + gpt-oss)
 
+> **Scope clarified 2026-07-26.**
+>
+> **This phase runs a full MT-PPO training + evaluation with the LLM judge as the reward**, exactly
+> like every other arm: same pipeline, same held-out set, same seed. It produces real EM and format
+> numbers that sit directly alongside Phase 7c's five arms.
+>
+> **One thing only is unavailable: a paper number to check the judge against.** Confirmed by direct
+> fetch — the paper's Table 2 is entirely deterministic rewards, and the judge appears only as
+> training reward curves (Figure 6) on NQ, with no benchmark result reported. So we can compare the
+> judge arm to *our* arms and to the paper's deterministic MT-PPO anchor (EM 0.453 / format 0.998),
+> but there is no published judge score to reproduce. That is a limitation on external validation,
+> not on the experiment.
+>
+> **Keep the judge reward swappable at the same seam as the deterministic outcome reward**, so
+> Phase 8b can run all three arms (binary EM / judge / F1 partial credit) without rework.
+
 ## Goal
 
 Add an LLM-as-judge reward signal on top of a working Phase 7 `MTPPOTrainer`, matching the

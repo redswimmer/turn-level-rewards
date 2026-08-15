@@ -5,17 +5,29 @@ construction require a real model/chat-template, which is exactly what the live 
 (not tests/unit/) validates instead, per CLAUDE.md's Guiding principles.
 """
 
+import math
+
 import pytest
 import torch
 import torch.nn as nn
 from turn_level_rewards.train_ppo import (
+    CollapseMonitor,
     MTPPOTrainer,
+    _final_retrieval_fraction,
     _parse_args,
     _PolicyAndCritic,
+    _row_cycle_from_step,
     build_ppo_config,
     compute_gae,
     compute_ppo_loss,
+    gather_action_logprobs,
+    normalize_advantages,
+    place_paper_rewards,
     place_turn_rewards,
+    resolve_auto_checkpoint,
+    resolve_stop_token_ids,
+    truncate_after_stop_token,
+    validate_tool_call_arguments,
 )
 
 
@@ -218,6 +230,46 @@ def test_compute_ppo_loss_value_loss_scales_with_squared_error():
     assert result["loss"].item() == pytest.approx(0.5 * 4.0)  # value_loss_coef defaults to 0.5
 
 
+def test_compute_ppo_loss_reports_clip_fraction_and_ratio_mean():
+    """Position 0: new_logprobs=10.0 vs old_logprobs=0.0 -> ratio=exp(10), clipped (clip_eps=0.2).
+    Position 1: new_logprobs==old_logprobs -> ratio=1.0, not clipped. clip_fraction should be
+    exactly 0.5 (one of two positions clipped); ratio_mean should be the plain mean of the two
+    raw (pre-clip) ratios.
+    """
+    result = compute_ppo_loss(
+        new_logprobs=torch.tensor([10.0, 0.0]),
+        old_logprobs=torch.tensor([0.0, 0.0]),
+        advantages=torch.tensor([1.0, 1.0]),
+        returns=torch.tensor([0.0, 0.0]),
+        new_values=torch.tensor([0.0, 0.0]),
+        action_mask=torch.tensor([1.0, 1.0]),
+        clip_eps=0.2,
+    )
+
+    expected_ratio_mean = (torch.exp(torch.tensor(10.0)).item() + 1.0) / 2
+    assert result["clip_fraction"].item() == pytest.approx(0.5)
+    assert result["ratio_mean"].item() == pytest.approx(expected_ratio_mean, rel=1e-4)
+
+
+def test_compute_ppo_loss_diagnostic_fields_ignore_masked_out_positions():
+    """action_mask=0 at position 1 (a wild, would-be-clipped ratio) must not count toward
+    clip_fraction or ratio_mean -- only the masked-in position 0 (ratio=1.0, not clipped)
+    should be visible.
+    """
+    result = compute_ppo_loss(
+        new_logprobs=torch.tensor([0.0, 999.0]),
+        old_logprobs=torch.tensor([0.0, 0.0]),
+        advantages=torch.tensor([1.0, 1.0]),
+        returns=torch.tensor([0.0, 0.0]),
+        new_values=torch.tensor([0.0, 0.0]),
+        action_mask=torch.tensor([1.0, 0.0]),
+        clip_eps=0.2,
+    )
+
+    assert result["clip_fraction"].item() == pytest.approx(0.0)
+    assert result["ratio_mean"].item() == pytest.approx(1.0)
+
+
 def test_build_ppo_config_fixed_hyperparameters_identical_across_conditions():
     """These come from the paper (Section 6.2/C.1.3) or the design spec's stated assumptions --
     every one must hold for BOTH conditions, since ppo/mt_ppo differ only in reward placement
@@ -330,3 +382,570 @@ def test_parse_args_overrides():
     assert args.train_size == 90447
     assert args.max_steps == 500
     assert args.num_rollouts_per_step == 8
+
+
+def test_final_retrieval_fraction_returns_zero_for_no_turns():
+    assert _final_retrieval_fraction({"retrieval_fraction_after_each_turn": []}) == 0.0
+
+
+def test_final_retrieval_fraction_returns_last_value():
+    rollout = {"retrieval_fraction_after_each_turn": [0.5, 1.0]}
+    assert _final_retrieval_fraction(rollout) == 1.0
+
+
+def test_collapse_monitor_stops_on_non_finite_loss():
+    monitor = CollapseMonitor()
+
+    alerts = monitor.check(step=5, loss=float("nan"), mean_reward=1.0, mean_format_reward=0.1)
+
+    assert len(alerts) == 1
+    assert alerts[0].should_stop is True
+    assert alerts[0].level == "ERROR"
+
+
+def test_collapse_monitor_no_alerts_for_healthy_run():
+    """A healthy run's mean reward MOVES between steps.
+
+    This originally passed a fixed mean_reward=1.0 for all 30 steps. That encoded an assumption
+    the 2026-07-24 flat-reward incident disproved: a bit-identical mean reward step after step is
+    itself the failure signature (see test_collapse_monitor_fires_constant_reward_alert), not a
+    picture of health, so the healthy case has to vary to still mean anything.
+    """
+    monitor = CollapseMonitor()
+
+    for step in range(30):
+        alerts = monitor.check(
+            step=step, loss=0.5, mean_reward=1.0 + 0.01 * step, mean_format_reward=0.1
+        )
+        assert alerts == []
+
+
+def test_collapse_monitor_fires_dead_reward_alert_after_threshold():
+    """The alert fires exactly once, part-way through this loop (once step reaches the
+    threshold), then stays suppressed for the remaining iterations (see
+    test_collapse_monitor_each_alert_fires_only_once) -- so alerts must be accumulated across
+    the whole loop, not read off only the final iteration's return value, which would always be
+    empty by the fire-once design.
+    """
+    monitor = CollapseMonitor()
+
+    fired: list = []
+    for step in range(25):
+        fired.extend(monitor.check(step=step, loss=0.5, mean_reward=0.0, mean_format_reward=0.1))
+
+    assert len(fired) == 1
+    assert fired[0].should_stop is False
+    assert "Dead reward" in fired[0].title
+
+
+def test_collapse_monitor_fires_format_collapse_alert_after_regression():
+    """format_reward is healthy for the first 10 steps, then craters and stays there -- should
+    alert once it's been non-positive for enough consecutive steps, but only because it
+    regressed FROM a compliant state (this is a collapse signal, not a "never learned" signal,
+    which test_collapse_monitor_fires_dead_reward_alert_after_threshold already covers).
+    """
+    monitor = CollapseMonitor()
+
+    for step in range(10):
+        alerts = monitor.check(step=step, loss=0.5, mean_reward=1.0, mean_format_reward=0.1)
+        assert alerts == []
+
+    # Accumulated across the loop, not read off only the final iteration -- see the analogous
+    # note on test_collapse_monitor_fires_dead_reward_alert_after_threshold above; the alert
+    # fires part-way through this range and is then suppressed for the rest of it.
+    fired: list = []
+    for step in range(10, 35):
+        fired.extend(monitor.check(step=step, loss=0.5, mean_reward=-0.1, mean_format_reward=-0.1))
+
+    assert len(fired) == 1
+    assert "Format compliance" in fired[0].title
+    assert fired[0].should_stop is False
+
+
+def test_collapse_monitor_each_alert_fires_only_once():
+    monitor = CollapseMonitor()
+
+    for step in range(25):
+        monitor.check(step=step, loss=0.5, mean_reward=0.0, mean_format_reward=0.1)
+
+    more_alerts = monitor.check(step=25, loss=0.5, mean_reward=0.0, mean_format_reward=0.1)
+    assert more_alerts == []
+
+
+def test_collapse_monitor_fires_constant_reward_alert():
+    """Reward pinned at one nonzero value for many steps is a dead signal, not a healthy one.
+
+    This is the exact 2026-07-24 failure the old monitor could not see: mean_reward was -0.1 on
+    every one of 158 steps. The pre-existing "Dead reward" check only tested `mean_reward != 0.0`,
+    so a constant -0.1 marked the reward "alive" at step 0 and permanently suppressed the alert.
+    """
+    monitor = CollapseMonitor()
+
+    fired: list = []
+    for step in range(25):
+        fired.extend(monitor.check(step=step, loss=0.5, mean_reward=-0.1, mean_format_reward=0.1))
+
+    assert len(fired) == 1
+    assert "Constant reward" in fired[0].title
+    assert fired[0].should_stop is False
+
+
+def test_collapse_monitor_fires_format_never_compliant_alert():
+    """format_reward non-positive from the very first step must alert too.
+
+    The pre-existing collapse check was gated on `elif self._format_ever_compliant`, so a run that
+    was NEVER compliant -- which is what a broken rollout loop produces -- could never trip it.
+    A never-compliant run is a more urgent signal than a regression, not a lesser one.
+    """
+    monitor = CollapseMonitor()
+
+    fired: list = []
+    for step in range(25):
+        fired.extend(monitor.check(step=step, loss=0.5, mean_reward=-0.1, mean_format_reward=-0.1))
+
+    titles = [alert.title for alert in fired]
+    assert "Format never compliant" in titles
+    assert all(alert.should_stop is False for alert in fired)
+
+
+def test_collapse_monitor_no_format_alert_once_compliance_is_seen():
+    monitor = CollapseMonitor()
+
+    fired: list = []
+    for step in range(25):
+        fired.extend(
+            monitor.check(
+                step=step, loss=0.5, mean_reward=0.5 + 0.01 * step, mean_format_reward=0.1
+            )
+        )
+
+    assert fired == []
+
+
+def test_resolve_stop_token_ids_puts_the_chat_turn_terminator_first():
+    """The tokenizer's eos (the chat turn terminator) must be a stop id, even when the model's own
+    generation_config names a different one.
+
+    This is the root cause of the 2026-07-24 flat-reward incident, pinned as a test: for
+    Qwen/Qwen3.5-0.8B, tokenizer.eos_token_id is <|im_end|> (248046) but
+    model.generation_config.eos_token_id is <|endoftext|> (248044). Generating with only the
+    latter runs every turn past its own terminator.
+    """
+    assert resolve_stop_token_ids(248046, 248044) == [248046, 248044]
+
+
+def test_resolve_stop_token_ids_deduplicates_and_accepts_a_list_or_none():
+    assert resolve_stop_token_ids(248046, 248046) == [248046]
+    assert resolve_stop_token_ids(248046, [248044, 248046]) == [248046, 248044]
+    assert resolve_stop_token_ids(248046, None) == [248046]
+
+
+def test_truncate_after_stop_token_keeps_the_terminator_and_drops_everything_after():
+    """A turn ends at its terminator; anything decoded past it is not part of this turn.
+
+    Real observed tail from the incident: after emitting <|im_end|>, the policy kept decoding
+    `\\n<|im_start|>user\\n<tool_response>{"results": ...}` -- hallucinating the environment's next
+    turn. Those tokens were being marked action_mask=1 and trained on.
+    """
+    assert truncate_after_stop_token([1, 2, 99, 3, 4], stop_token_ids=[99]) == [1, 2, 99]
+
+
+def test_truncate_after_stop_token_is_a_noop_when_no_stop_token_is_present():
+    """A turn that hit max_new_tokens without terminating is returned whole, not silently emptied."""
+    assert truncate_after_stop_token([1, 2, 3], stop_token_ids=[99]) == [1, 2, 3]
+
+
+def test_truncate_after_stop_token_cuts_at_the_first_of_several_stop_ids():
+    assert truncate_after_stop_token([1, 88, 2, 99], stop_token_ids=[99, 88]) == [1, 88]
+
+
+def test_parse_args_resume_and_save_steps_defaults():
+    args = _parse_args(["--condition", "ppo"])
+
+    assert args.save_steps == 50
+    assert args.resume_from_checkpoint is None
+
+
+def test_parse_args_resume_and_save_steps_overrides():
+    args = _parse_args(
+        [
+            "--condition",
+            "ppo",
+            "--save-steps",
+            "10",
+            "--resume-from-checkpoint",
+            "outputs/ppo/checkpoint-100",
+        ]
+    )
+
+    assert args.save_steps == 10
+    assert args.resume_from_checkpoint == "outputs/ppo/checkpoint-100"
+
+
+def test_row_cycle_from_step_starts_at_beginning_when_global_step_is_zero():
+    rows = [{"id": 0}, {"id": 1}, {"id": 2}]
+    cycle = _row_cycle_from_step(rows, global_step=0, num_rollouts_per_step=2)
+
+    assert [next(cycle)["id"] for _ in range(3)] == [0, 1, 2]
+
+
+def test_row_cycle_from_step_resumes_at_correct_position():
+    rows = [{"id": 0}, {"id": 1}, {"id": 2}]
+    # From scratch: step 0 consumes rows 0,1; step 1 consumes rows 2,0. After global_step=2
+    # completed steps, 4 rows have been consumed (0,1,2,0) -- the next draw should be row 1.
+    cycle = _row_cycle_from_step(rows, global_step=2, num_rollouts_per_step=2)
+
+    assert next(cycle)["id"] == 1
+    assert next(cycle)["id"] == 2
+
+
+def test_resolve_auto_checkpoint_returns_the_latest_checkpoint(tmp_path):
+    (tmp_path / "checkpoint-100").mkdir()
+    (tmp_path / "checkpoint-300").mkdir()
+    (tmp_path / "checkpoint-200").mkdir()
+
+    assert resolve_auto_checkpoint(str(tmp_path)).endswith("checkpoint-300")
+
+
+def test_resolve_auto_checkpoint_raises_a_clear_error_on_a_missing_output_dir(tmp_path):
+    """A first launch with `auto` used to die on a FileNotFoundError from inside transformers'
+    os.listdir, not on this module's own message -- the output dir does not exist yet, which is
+    the same "nothing to resume" case as an empty one.
+    """
+    with pytest.raises(ValueError, match="no checkpoint found"):
+        resolve_auto_checkpoint(str(tmp_path / "does-not-exist"))
+
+
+def test_resolve_auto_checkpoint_raises_on_an_existing_but_empty_output_dir(tmp_path):
+    with pytest.raises(ValueError, match="no checkpoint found"):
+        resolve_auto_checkpoint(str(tmp_path))
+
+
+def _search(query: str, topk: int = 3) -> str:
+    """Stand-in with the same annotation shape as SearchEnv.search."""
+    return ""
+
+
+def test_validate_tool_call_arguments_accepts_a_well_formed_call():
+    assert validate_tool_call_arguments(_search, {"query": "who is X"}) is None
+    assert validate_tool_call_arguments(_search, {"query": "x", "topk": 5}) is None
+
+
+def test_validate_tool_call_arguments_rejects_a_non_string_query():
+    """The 2026-07-24 crash: the policy emitted a numeric/null query, which bind() accepts
+    (Python does not enforce annotations) and the retrieval server then rejected with HTTP 422,
+    taking the whole run down at step 166.
+
+    A wrongly-TYPED argument is the same class of model mistake as a wrongly-NAMED one, so it
+    has to be caught here and fed back to the policy, not raised out of search().
+    """
+    assert "query" in (validate_tool_call_arguments(_search, {"query": 123}) or "")
+    assert "query" in (validate_tool_call_arguments(_search, {"query": None}) or "")
+
+
+def test_validate_tool_call_arguments_rejects_unknown_and_missing_arguments():
+    assert validate_tool_call_arguments(_search, {"return": "x"}) is not None
+    assert validate_tool_call_arguments(_search, {}) is not None
+
+
+def test_validate_tool_call_arguments_allows_a_bool_where_int_is_annotated():
+    """bool is a subclass of int, so isinstance already accepts it -- pinned so a future
+    tightening does not start rejecting calls the retrieval server would have served fine.
+    """
+    assert validate_tool_call_arguments(_search, {"query": "x", "topk": True}) is None
+
+
+def test_validate_tool_call_arguments_ignores_parameters_without_a_simple_annotation():
+    def tool(payload, flag: str = "a"):
+        return ""
+
+    assert validate_tool_call_arguments(tool, {"payload": {"anything": 1}}) is None
+
+
+def _logprob_fixture(num_positions: int, vocab: int = 64, hidden: int = 8):
+    """Small float32 CPU stand-in for the policy's lm_head + selected hidden states."""
+    torch.manual_seed(0)
+    lm_head = nn.Linear(hidden, vocab, bias=False)
+    states = torch.randn(num_positions, hidden, requires_grad=True)
+    targets = torch.randint(0, vocab, (num_positions,))
+    return lm_head, states, targets
+
+
+def _unchunked_reference(lm_head, states, targets):
+    """What _forward_policy_logprobs computed before chunking: one [n, vocab] tensor."""
+    log_probs = torch.log_softmax(lm_head(states), dim=-1)
+    return log_probs.gather(1, targets.unsqueeze(-1)).squeeze(-1)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 4, 16, 1000])
+def test_gather_action_logprobs_matches_the_unchunked_computation(chunk_size):
+    """Chunking is a memory optimisation, so it must not change the numbers meaningfully.
+
+    Each position's log_softmax is over its own vocab row and is mathematically independent of
+    every other position. The agreement is not bit-exact, though, and the first version of this
+    test wrongly asserted torch.equal: a [chunk, hidden] x [hidden, vocab] matmul can select a
+    different GEMM kernel than the full-height one, so lm_head's own output moves by about one
+    ULP (measured: 4.77e-07 in float32, and exactly 0 when chunk_size covers every position).
+    Tolerance is set just above that, tight enough that any real algorithmic change fails.
+    """
+    lm_head, states, targets = _logprob_fixture(10)
+    expected = _unchunked_reference(lm_head, states, targets)
+
+    actual = gather_action_logprobs(lm_head, states, targets, chunk_size=chunk_size)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=0)
+
+
+def test_gather_action_logprobs_produces_identical_gradients():
+    """The value being right is not enough -- this sits inside a backward pass, so the gradient
+    it feeds to the policy has to match too.
+    """
+    lm_head, states, targets = _logprob_fixture(10)
+    _unchunked_reference(lm_head, states, targets).sum().backward()
+    assert states.grad is not None
+    expected_grad = states.grad.clone()
+
+    states.grad = None
+    gather_action_logprobs(lm_head, states, targets, chunk_size=3).sum().backward()
+    actual_grad = states.grad
+
+    assert actual_grad is not None
+    assert torch.allclose(actual_grad, expected_grad, atol=1e-6)
+
+
+def test_gather_action_logprobs_handles_a_single_action_token():
+    lm_head, states, targets = _logprob_fixture(1)
+
+    actual = gather_action_logprobs(lm_head, states, targets, chunk_size=256)
+
+    assert actual.shape == (1,)
+    assert torch.allclose(actual, _unchunked_reference(lm_head, states, targets), atol=1e-6)
+
+
+def test_gather_action_logprobs_rejects_a_non_positive_chunk_size():
+    """A chunk_size of 0 would loop forever building empty chunks -- fail loudly instead."""
+    lm_head, states, targets = _logprob_fixture(4)
+
+    with pytest.raises(ValueError, match="chunk_size"):
+        gather_action_logprobs(lm_head, states, targets, chunk_size=0)
+
+
+def test_normalize_advantages_gives_zero_mean_unit_std():
+    """PPO's policy_lr is calibrated for unit-scale advantages.
+
+    This repo takes policy_lr=1e-6 straight from the paper's Appendix C.1.3, but the paper runs
+    on veRL, which normalizes advantages by default. Feeding raw advantages -- here typically
+    ~0.1-0.3, since most episodes score the -0.1 format floor -- into an LR tuned for ~1.0 makes
+    the effective step size several times smaller than intended. Normalizing restores the
+    precondition the borrowed hyperparameter assumes.
+    """
+    normalized = normalize_advantages([1.0, 2.0, 3.0, 4.0])
+
+    mean = sum(normalized) / len(normalized)
+    var = sum((x - mean) ** 2 for x in normalized) / len(normalized)
+    assert mean == pytest.approx(0.0, abs=1e-6)
+    assert var == pytest.approx(1.0, abs=1e-3)
+
+
+def test_normalize_advantages_preserves_ordering_and_sign_structure():
+    """Normalization must rescale, never reorder -- the relative ranking of actions IS the signal."""
+    raw = [-0.5, 0.1, 0.4, 2.0]
+
+    normalized = normalize_advantages(raw)
+
+    assert sorted(normalized) == normalized
+    assert normalized[0] < 0 < normalized[-1]
+
+
+def test_normalize_advantages_handles_zero_variance_without_dividing_by_zero():
+    """Every episode scoring identically is a real, observed state (it is what the 2026-07-24
+    flat-reward bug produced). It must yield zero advantage, not NaN.
+    """
+    normalized = normalize_advantages([0.3, 0.3, 0.3])
+
+    assert all(x == pytest.approx(0.0) for x in normalized)
+    assert all(math.isfinite(x) for x in normalized)
+
+
+def test_normalize_advantages_handles_a_single_value():
+    assert normalize_advantages([2.5]) == [0.0]
+
+
+def test_compute_ppo_loss_kl_term_is_non_negative_and_penalises_divergence():
+    """The KL term must PENALISE moving away from the rollout policy.
+
+    The original implementation used mean(new_logprobs - old_logprobs), which over tokens sampled
+    from the old policy estimates -KL(old||new) <= 0. Adding +kl_beta * that to the loss and
+    minimising therefore MAXIMISED divergence -- the opposite of a trust region. This pins the
+    k3 estimator (exp(d) - d - 1, d = old - new), which is non-negative by construction.
+    """
+    identical = compute_ppo_loss(
+        new_logprobs=torch.tensor([0.5, 0.5]),
+        old_logprobs=torch.tensor([0.5, 0.5]),
+        advantages=torch.zeros(2),
+        returns=torch.zeros(2),
+        new_values=torch.zeros(2),
+        action_mask=torch.ones(2),
+    )
+    diverged = compute_ppo_loss(
+        new_logprobs=torch.tensor([-1.5, 2.0]),
+        old_logprobs=torch.tensor([0.5, 0.5]),
+        advantages=torch.zeros(2),
+        returns=torch.zeros(2),
+        new_values=torch.zeros(2),
+        action_mask=torch.ones(2),
+    )
+
+    assert identical["kl"].item() == pytest.approx(0.0, abs=1e-6)
+    assert diverged["kl"].item() > 0.0
+
+
+def test_compute_ppo_loss_kl_penalty_increases_the_loss():
+    """With advantages and value error zeroed out, a diverging policy must score a HIGHER loss
+    than a matching one -- that is what makes the term a penalty rather than a reward.
+    """
+    zeros, ones = torch.zeros(2), torch.ones(2)
+    matched = compute_ppo_loss(
+        new_logprobs=torch.tensor([0.5, 0.5]),
+        old_logprobs=torch.tensor([0.5, 0.5]),
+        advantages=zeros,
+        returns=zeros,
+        new_values=zeros,
+        action_mask=ones,
+        kl_beta=1.0,
+    )
+    diverged = compute_ppo_loss(
+        new_logprobs=torch.tensor([-1.0, 1.5]),
+        old_logprobs=torch.tensor([0.5, 0.5]),
+        advantages=zeros,
+        returns=zeros,
+        new_values=zeros,
+        action_mask=ones,
+        kl_beta=1.0,
+    )
+
+    assert diverged["loss"].item() > matched["loss"].item()
+
+
+def test_place_paper_rewards_ppo_or_places_outcome_only():
+    """PPO-OR: Section 6.1, "trained with ONLY outcome rewards". No R^I anywhere."""
+    rewards = place_paper_rewards(
+        num_tokens=6,
+        turn_boundary_token_indices=[1, 3],
+        turn_rewards=[0.3, -0.1],
+        outcome_reward_value=1.0,
+        condition="ppo",
+    )
+
+    assert rewards == [0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+
+
+def test_place_paper_rewards_ppo_mr_sums_everything_onto_the_last_token():
+    """PPO-MR: same information as MT-PPO, collapsed into one trajectory-level scalar.
+
+    This is the control that makes the ablation interpretable -- ppo -> ppo_mr isolates the
+    added reward signal, ppo_mr -> mt_ppo isolates Eq. 9's turn-level placement. Comparing only
+    ppo to mt_ppo changes both at once.
+    """
+    rewards = place_paper_rewards(
+        num_tokens=6,
+        turn_boundary_token_indices=[1, 3],
+        turn_rewards=[0.3, -0.1],
+        outcome_reward_value=1.0,
+        condition="ppo_mr",
+    )
+
+    assert rewards == [0.0, 0.0, 0.0, 0.0, 0.0, pytest.approx(1.2)]
+    assert rewards[1] == 0.0 and rewards[3] == 0.0
+
+
+def test_place_paper_rewards_mt_ppo_places_each_turn_reward_at_its_boundary():
+    """MT-PPO: Eq. 9 -- R^I at each intermediate turn ending, R^O at the trajectory's end."""
+    rewards = place_paper_rewards(
+        num_tokens=6,
+        turn_boundary_token_indices=[1, 3],
+        turn_rewards=[0.3, -0.1],
+        outcome_reward_value=1.0,
+        condition="mt_ppo",
+    )
+
+    assert rewards[1] == pytest.approx(0.3)
+    assert rewards[3] == pytest.approx(-0.1)
+    assert rewards[-1] == pytest.approx(1.0)
+    assert rewards[0] == rewards[2] == rewards[4] == 0.0
+
+
+def test_place_paper_rewards_mr_and_mt_carry_identical_total_reward():
+    """The two arms must differ ONLY in placement -- if their totals differed, the comparison
+    would be confounded by reward magnitude rather than isolating Eq. 9.
+    """
+    kwargs = {
+        "num_tokens": 8,
+        "turn_boundary_token_indices": [2, 5],
+        "turn_rewards": [0.3, -0.15],
+        "outcome_reward_value": 0.2,
+    }
+
+    mr = place_paper_rewards(condition="ppo_mr", **kwargs)
+    mt = place_paper_rewards(condition="mt_ppo", **kwargs)
+
+    assert sum(mr) == pytest.approx(sum(mt))
+
+
+def test_place_paper_rewards_with_no_intermediate_turns_is_identical_across_conditions():
+    """An episode that answers immediately has no R^I to place, so all three arms must agree --
+    otherwise the conditions would differ on episodes where the treatment cannot apply.
+    """
+    kwargs = {
+        "num_tokens": 3,
+        "turn_boundary_token_indices": [],
+        "turn_rewards": [],
+        "outcome_reward_value": -1.0,
+    }
+
+    assert (
+        place_paper_rewards(condition="ppo", **kwargs)
+        == place_paper_rewards(condition="ppo_mr", **kwargs)
+        == place_paper_rewards(condition="mt_ppo", **kwargs)
+        == [0.0, 0.0, -1.0]
+    )
+
+
+def test_place_paper_rewards_rejects_mismatched_turn_inputs():
+    with pytest.raises(ValueError, match="equal length"):
+        place_paper_rewards(
+            num_tokens=4,
+            turn_boundary_token_indices=[1, 2],
+            turn_rewards=[0.3],
+            outcome_reward_value=1.0,
+            condition="mt_ppo",
+        )
+
+
+def test_paper_turn_reward_search_penalty_grows_with_cumulative_searches():
+    """lambda_s penalises the CUMULATIVE search count, so later turns are penalised harder --
+    the term the paper says prevents "uncontrolled search usage" when omitted.
+    """
+    from turn_level_rewards.rewards import paper_turn_reward
+
+    first = paper_turn_reward(found_gold=True, format_ok=True, cumulative_searches=1)
+    fourth = paper_turn_reward(found_gold=True, format_ok=True, cumulative_searches=4)
+
+    assert first == pytest.approx(0.3 + 0.1 - 0.1)
+    assert fourth == pytest.approx(0.3 + 0.1 - 0.4)
+    assert fourth < first
+
+
+def test_paper_outcome_reward_scale_matches_the_paper():
+    from turn_level_rewards.rewards import paper_binary_outcome_reward, paper_outcome_reward
+
+    answered = [{"role": "assistant", "content": "<answer>Paris</answer>"}]
+    unanswered = [{"role": "tool", "name": "search", "content": "docs"}]
+
+    assert paper_outcome_reward(answered, ["Paris"]) == 1.0
+    assert paper_outcome_reward(answered, ["Berlin"]) == 0.2
+    assert paper_outcome_reward(unanswered, ["Paris"]) == -1.0
+    # PPO-OR carries no format term at all: not answering and answering wrongly both score 0.0.
+    assert paper_binary_outcome_reward(answered, ["Paris"]) == 1.0
+    assert paper_binary_outcome_reward(answered, ["Berlin"]) == 0.0
+    assert paper_binary_outcome_reward(unanswered, ["Paris"]) == 0.0

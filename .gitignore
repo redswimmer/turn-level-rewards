@@ -14,3 +14,6 @@ data/
 
 # Training checkpoints
 outputs/
+
+# Agent run logs (regenerable; the durable record is outputs/<arm>/train_log.jsonl)
+logs/
