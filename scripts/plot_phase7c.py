@@ -100,7 +100,11 @@ def plot_vs_paper(summary: dict, out: Path) -> None:
             p = PAPER_ANCHORS[arm][idx]
             paper.append(p if p is not None else 0.0)
         ax.barh([i + 0.19 for i in y], paper, height=0.36, color=PAPER, label="Paper (Qwen2.5-7B)")
-        ax.barh([i - 0.19 for i in y], ours, height=0.36, color=OURS, label="This repo (0.8B)")
+        # Both series name their model in full: "0.8B" alone reads as a size rather than a model,
+        # which hides that these are different base models and not one model at two scales.
+        ax.barh(
+            [i - 0.19 for i in y], ours, height=0.36, color=OURS, label="This repo (Qwen3.5-0.8B)"
+        )
         for i, arm in enumerate(arms):
             # Coloured to each series it describes: a neutral grey label sitting between two bars
             # gives the reader no way to tell which of them it belongs to.
