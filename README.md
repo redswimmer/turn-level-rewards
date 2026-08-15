@@ -13,8 +13,7 @@ holds up at a much smaller scale.
 
 Inspired by ["Reinforcing Multi-Turn Reasoning in LLM Agents via Turn-Level Reward
 Design"](https://arxiv.org/abs/2505.11821) (arXiv:2505.11821), specifically its GRPO and PPO case
-study. The reward designs below follow the paper's own definitions; experiments of my own are
-labelled as such and kept separate from the reproduction.
+study. The reward designs below follow the paper's own definitions.
 
 **Biggest deviation**: a much smaller model on a single consumer GPU — `Qwen3.5-0.8B` on one
 NVIDIA RTX 4090, vs. the paper's `Qwen2.5-7B` on 8 NVIDIA H100s — with a batch size 128× smaller.
@@ -32,8 +31,9 @@ answer. Different rollouts of the same question can end up searching a different
 
 What RL updates is only the **model's weights**. The harness around it — the tool-calling loop,
 the system prompt, the retrieval backend, the 4-turn cap — is identical in every condition below
-and is never trained. Only the reward function differs, so any difference in results is attributable
-to the reward design rather than to the agent's architecture.
+and is never trained. Only the reward design and the RL algorithm differ between conditions, so
+any difference in results is attributable to those choices rather than to the agent's
+architecture.
 
 ```mermaid
 flowchart LR
@@ -187,7 +187,7 @@ and see where the collapse stops.
 
 ### A search penalty is not what prevents runaway searching
 
-`MT-PPO` is penalized for each search; the other two arms are not. The paper says that without
+`MT-PPO` is penalized for each search; the other two PPO arms are not. The paper says that without
 this penalty, models search out of control.
 
 ![Searches per episode: the unpenalised arm sits near 2 while the collapsed arm pins to the cap](results/phase7c_searches.png)
@@ -204,7 +204,7 @@ gets a small reward for any well-formed answer, so stopping always pays a little
 The paper's headline is that delivering rewards at the turn that earned them beats saving them
 all for the end — `MT-PPO` beats `PPO-MR`. The same thing happened here, on a model roughly a
 tenth the size: `MT-PPO` answered more questions exactly right and followed the answer format
-more reliably (numbers in the table above). Every arm is a single run, so trust the direction
+more reliably (numbers in the table and chart above). Every arm is a single run, so trust the direction
 more than the size of the gap.
 
 ## Future work

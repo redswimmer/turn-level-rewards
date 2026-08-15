@@ -279,102 +279,13 @@ def plot_searches(curves: dict, out: Path) -> None:
     plt.close(fig)
 
 
-# The graded-reward GRPO follow-ups (seed 123, 600 steps). Separate track from the arms above:
-# different reward, seed and step count, so these never share an axis with the paper comparison.
-FOLLOWUPS = [
-    ("Baseline\n(no penalty)", "seed123_600steps"),
-    ("Length\npenalty", "lengthpenalty"),
-    ("Search-count\npenalty", "searchpenalty"),
-    ("Remove prompt cap\n(no penalty)", "nocapprompt"),
-]
-
-
-def plot_followups(out: Path) -> None:
-    """Grouped bars: four reward configurations, outcome-only vs. merged.
-
-    Two panels because exact match alone shows only *that* the outcome-only arms collapsed. Mean
-    completion length shows *how*: the length-penalised arm answers in ~12 tokens, which is what
-    "degenerate" actually looks like and is not recoverable from an accuracy bar.
-    """
-    labels = [label for label, _ in FOLLOWUPS]
-    x = range(len(FOLLOWUPS))
-
-    def read(condition: str, suffix: str) -> dict:
-        return json.loads((RESULTS / f"{condition}_{suffix}_eval_metrics.json").read_text())
-
-    runs = {c: [read(c, suffix) for _, suffix in FOLLOWUPS] for c in ("outcome_only", "turn_level")}
-    fig, (em_ax, len_ax) = _fig(11, 4.2, ncols=2)
-
-    for ax, key, title in (
-        (em_ax, "eval_exact_match", "Held-out Exact Match (this repo)"),
-        (len_ax, "eval_completions/mean_length", "Mean Completion Length (tokens, this repo)"),
-    ):
-        for offset, (condition, colour, label) in enumerate(
-            (("outcome_only", PAPER, "Outcome only"), ("turn_level", OURS, "Merged reward"))
-        ):
-            values = [m[key] for m in runs[condition]]
-            ax.bar(
-                [i + (offset - 0.5) * 0.38 for i in x],
-                values,
-                width=0.36,
-                color=colour,
-                label=label,
-            )
-            for i, v in enumerate(values):
-                ax.text(
-                    i + (offset - 0.5) * 0.38,
-                    v,
-                    f"{v:.3f}" if key.endswith("exact_match") else f"{v:.0f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=7.5,
-                    color=INK_SOFT,
-                )
-        ax.set_xticks(list(x), labels, fontsize=8.5)
-        ax.set_title(title, fontsize=11.5, color=INK, weight="bold", pad=8)
-        ax.grid(axis="x", visible=False)
-        # Headroom for the value labels, and for the legend that sits over the left panel.
-        ax.set_ylim(0, max(m[key] for r in runs.values() for m in r) * 1.22)
-
-    # The baseline is what every other bar is being judged against -- mark it rather than
-    # relying on the reader to keep the leftmost pair in mind across two panels.
-    for ax in (em_ax, len_ax):
-        ax.axvline(0.5, color=GRID, linewidth=1.0, linestyle="--")
-    # Upper-left, not upper-right: the tallest bar in this panel is the rightmost one.
-    em_ax.legend(frameon=False, fontsize=8.5, loc="upper left", labelcolor=INK_SOFT)
-
-    fig.suptitle(
-        "My graded-reward GRPO experiments",
-        fontsize=12.5,
-        color=INK,
-        x=0.007,
-        ha="left",
-        y=0.99,
-    )
-    fig.text(
-        0.007,
-        0.015,
-        # Kept because it travels with the image: these bars invite comparison against the paper
-        # arms, and nothing in the chart itself says they were run under a different reward, seed
-        # and step count. What the bars already show is left to the bars.
-        "Graded reward (F1 + exact-match bonus), seed 123, 600 steps — a separate track from the "
-        "paper reproduction, not comparable to it.",
-        fontsize=8.5,
-        color=INK_SOFT,
-    )
-    fig.tight_layout(rect=(0, 0.05, 1, 0.95))
-    fig.savefig(out, dpi=200, facecolor=SURFACE)
-    plt.close(fig)
-
-
 def main() -> None:
     summary = json.loads((RESULTS / "phase7c-summary.json").read_text())
     curves = json.loads((RESULTS / "phase7c-curves.json").read_text())
     plot_vs_paper(summary, RESULTS / "phase7c_vs_paper.png")
     plot_collapses(curves, RESULTS / "phase7c_collapses.png")
     plot_searches(curves, RESULTS / "phase7c_searches.png")
-    plot_followups(RESULTS / "followup_experiments_comparison.png")
-    print("wrote 4 figures to results/")
+    print("wrote 3 figures to results/")
 
 
 if __name__ == "__main__":
