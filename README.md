@@ -284,10 +284,10 @@ baseline: **0.242 EM** outcome-only vs **0.306** merged.
 **None improved on the baseline**, and *how* they failed is the same lesson as Result 2 — this time
 triggered by an added penalty rather than a missing bonus:
 
-- **Length penalty** (not from the paper): outcome-only **collapsed to 0.090 EM**, garbled text.
-  Merged reward dropped only to 0.254 and stayed coherent.
-- **The paper's search-count penalty, borrowed into GRPO**: outcome-only **collapsed to 0.024 EM**.
-  Merged reward fell to 0.221, then partially recovered late in training.
+- **Length penalty** (not from the paper): outcome-only **collapsed to 0.090 EM**, answering in
+  ~12 tokens instead of 386. Merged reward dropped only to 0.254 and stayed coherent.
+- **The paper's search-count penalty, borrowed into GRPO**: outcome-only **collapsed to 0.024 EM**
+  and ~21 tokens. Merged reward fell to 0.221, then partially recovered late in training.
 - **Isolating control** (same prompt change, *no* penalty): outcome-only dropped only to 0.201;
   merged reward *rose* to 0.320. This pins both collapses on the penalty term itself.
 
