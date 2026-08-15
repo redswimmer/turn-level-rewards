@@ -304,6 +304,70 @@ def plot_collapse(curves: dict, out: Path) -> None:
     plt.close(fig)
 
 
+# Categorical slots for the four PPO arms. ppo is deliberately the desaturated one -- it is the
+# arm that died, and it should read as background against the three that trained.
+PPO_ARMS = [
+    ("MT-PPO", "mt_ppo", OURS),
+    ("PPO-MR (paper)", "ppo_mr_paper", PAPER),
+    ("PPO-MR + content (ours)", "ppo_mr", GAIN),
+    ("PPO-OR", "ppo", DEAD),
+]
+
+
+def plot_training(curves: dict, out: Path) -> None:
+    """Two panels that between them replace most of the section's prose.
+
+    Left: format compliance separates the arms cleanly and shows PPO-OR flatlining at zero.
+    Right: searches per episode, which is the whole of the "a search penalty is not what bounds
+    search" finding -- PPO-MR runs the penalty at zero and still sits near 2, while PPO-OR pins
+    itself to the 4-turn cap. Stated as numbers that comparison needs three sentences.
+    """
+    fig, (fmt_ax, turn_ax) = _fig(11, 4.2, ncols=2)
+
+    for ax, key, title in (
+        (fmt_ax, "format_compliance", "Answers in the required format"),
+        (turn_ax, "mean_tool_turns", "Searches per episode"),
+    ):
+        for name, arm, colour in PPO_ARMS:
+            series = curves[arm]
+            ax.plot(
+                series["step"],
+                _smooth(series[key]),
+                color=colour,
+                linewidth=2.0,
+                label=name if key == "format_compliance" else None,
+            )
+        ax.set_xlabel("training step", fontsize=9, color=INK_SOFT)
+        ax.set_title(title, fontsize=11, color=INK, pad=8, loc="left")
+
+    fmt_ax.set_ylim(0, 1.02)
+    fmt_ax.legend(frameon=False, fontsize=8.5, loc="center right", labelcolor=INK_SOFT)
+    # The cap is what makes "uncontrolled search" legible -- without it the reader cannot tell
+    # whether 4 turns per episode is a lot.
+    turn_ax.axhline(4, color=LOSS, linewidth=1.0, linestyle="--")
+    turn_ax.text(20, 3.82, "4-turn cap", fontsize=8, color=LOSS, va="top")
+    turn_ax.set_ylim(0, 4.4)
+
+    fig.suptitle(
+        "PPO-OR stops answering and searches to the cap; the reward-shaped arms do neither",
+        fontsize=12.5,
+        color=INK,
+        x=0.007,
+        ha="left",
+        y=0.99,
+    )
+    fig.text(
+        0.007,
+        0.015,
+        "PPO-OR's curve ends at step 160, where it was stopped. 15-step rolling mean.",
+        fontsize=8.5,
+        color=INK_SOFT,
+    )
+    fig.tight_layout(rect=(0, 0.05, 1, 0.95))
+    fig.savefig(out, dpi=200, facecolor=SURFACE)
+    plt.close(fig)
+
+
 # The graded-reward GRPO follow-ups (seed 123, 600 steps). Separate track from the arms above:
 # different reward, seed and step count, so these never share an axis with the paper comparison.
 FOLLOWUPS = [
@@ -396,8 +460,9 @@ def main() -> None:
     plot_vs_paper(summary, RESULTS / "phase7c_vs_paper.png")
     plot_decomposition(summary, RESULTS / "phase7c_decomposition.png")
     plot_collapse(curves, RESULTS / "phase7c_collapse.png")
+    plot_training(curves, RESULTS / "phase7c_training.png")
     plot_followups(RESULTS / "followup_experiments_comparison.png")
-    print("wrote 4 figures to results/")
+    print("wrote 5 figures to results/")
 
 
 if __name__ == "__main__":

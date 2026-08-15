@@ -158,24 +158,14 @@ flowchart LR
 
 Note what `R^I` contains that `PPO-MR` does not: a per-turn format term and a search-count penalty.
 Those are MT-PPO's own contribution, not baseline components — which turns out to matter a lot
-(see [Result 3](#3-what-the-papers-turn-level-gain-actually-contains)).
-
-### How this reproduction compares to the paper
-
-![This reproduction against the paper's published results](results/phase7c_vs_paper.png)
-
-All five arms, trained at seed 42 for 500 steps and evaluated on the same 7,404 held-out questions.
-**Format correctness tracks the paper closely; exact match sits systematically below it.** That
-split is what you'd expect from the one deviation that dominates everything else: the paper trains
-`Qwen2.5-7B`, this repo trains `Qwen3.5-0.8B` — **8.75× smaller**. Format is a dense per-episode
-signal that saturates quickly; exact match is sparse and hard, and is what the paper's much larger
-model and 128× larger batch actually buy.
-
-For scale: the paper reports its *untrained* `Qwen2.5-7B` at EM **0.160**, and its instruct variant
-at **0.292**. This repo's best *trained* arm reaches **0.301** — roughly where the paper's model
-starts.
+(see [the decomposition below](#the-papers-headline-gain-is-two-effects-not-one)).
 
 ## Results
+
+All five arms: same model, same scaffold, same seed, same data, 500 steps each, evaluated on the
+same 7,404 held-out questions. Only the reward differs.
+
+![This reproduction against the paper's published results](results/phase7c_vs_paper.png)
 
 | Arm (held-out, 7,404 questions) | Exact match | F1 | Format | Retrieval |
 | ------------------------------- | ----------- | ---- | ------ | --------- |
@@ -185,133 +175,103 @@ starts.
 | `GRPO-OR` | 0.000 | 0.015 | 0.421 | — |
 | `GRPO-MR` | **0.295** | **0.391** | **0.975** | 0.475 |
 
-`*` `PPO-OR` collapsed during training, so it is scored at its last checkpoint before collapse —
-the paper's own stated methodology for its crashed PPO baselines. `GRPO-OR` has no retrieval figure
-because its reward never inspects retrieval, so the metric was not computed for that arm.
+`*` scored at its last checkpoint before collapse, the paper's own methodology for its crashed
+baselines. `GRPO-OR`'s reward never inspects retrieval, so that metric doesn't exist for it.
 
-Six training runs (~14 GPU-hours) and seven full held-out evaluations (~45 GPU-hours) on one
-RTX 4090. Every arm ran 500 steps at seed 42 with identical hyperparameters; the arms took 488-495
-real gradient updates each, and no episode in any PPO arm ended without a chance to answer — the
-symmetry checks that make the comparison worth reading at all.
+**Format correctness tracks the paper closely; exact match sits systematically below it** — the
+signature of training a model **8.75× smaller** (`Qwen3.5-0.8B` vs `Qwen2.5-7B`). Format is dense
+and saturates quickly; exact match is sparse and hard, and is what the paper's larger model and
+128× larger batch actually buy. For scale, the paper's *untrained* baseline scores EM 0.160–0.292 —
+roughly where this repo's best *trained* arm lands.
 
-### 1. Turn-level reward reproduces — and the effect is larger here than in the paper
+### Turn-level reward reproduces, and the effect is larger here
 
-`PPO-MR → MT-PPO` gains **+0.039 exact match** and **+0.187 format correctness**. The paper reports
-+0.017 EM for the same step. Right direction, larger magnitude.
+`PPO-MR → MT-PPO` gains **+0.039 exact match** against the paper's +0.017. On the GRPO side the
+merged reward is the difference between a working model and a dead one: **0.000 → 0.295** EM.
 
-The same pattern holds on the GRPO side, where the merged reward is the only thing keeping the arm
-alive at all: `GRPO-OR → GRPO-MR` goes from **0.000 to 0.295** EM.
+### A binary outcome reward can permanently stop training
 
-### 2. A binary outcome reward can stop training permanently
+![PPO arms during training: format compliance and searches per episode](results/phase7c_training.png)
+
+Both binary-outcome-only arms — `PPO-OR` and `GRPO-OR`, two *different algorithms* — died the same
+structural death. `PPO-OR` is visible above: it stops answering entirely and pins itself to the
+4-turn search cap. It ends with the **highest retrieval of any arm** (0.529) and a format
+compliance of **0.003**. It learned to search, and never learned to commit.
 
 ![GRPO-OR collapsing: reward and reward-variance curves](results/phase7c_collapse.png)
 
-Both binary-outcome-only arms — `PPO-OR` and `GRPO-OR`, two *different algorithms* — died the same
-structural death. `GRPO-OR` is the cleaner illustration because the mechanism is directly visible:
+`GRPO-OR` shows the mechanism outright. Once every rollout in a group scores identically, GRPO's
+advantage — `(rᵢ − group mean) / group std` — is zero, so the gradient is **exactly 0.0000 for the
+final 300 steps**. Checkpoints 450 and 500 are byte-identical, and the frozen policy never called
+search once across all 7,404 held-out questions. A sparse binary reward isn't just slow to learn
+from; it's an absorbing state you cannot leave.
 
-- After step 184, reward is **exactly 0** and `frac_reward_zero_std` is pinned at **1.000**: every
-  rollout in every group scores identically.
-- GRPO's advantage is `(rᵢ − group mean) / group std`. When every rollout scores the same, the
-  advantage is zero, so **`grad_norm` is exactly 0.0000 for the remaining 300 steps**. Checkpoints
-  450 and 500 are byte-identical.
-- On held-out data the frozen policy **never called search once** across all 7,404 questions.
+This is a small-scale effect, not a refutation — the paper's `PPO-OR` reaches 0.435 EM. What
+triggers it is the chance a batch contains **zero** correct answers, `(1−p)^N`: a smaller model
+lowers `p`, a smaller batch lowers `N`, and they compound in the same exponent.
 
-`PPO-OR` failed differently but for the same reason — it reached format compliance of **0.003**
-while posting the *highest retrieval of any arm* (0.529). It learned to search, and then never
-answered. High retrieval on a dead arm is what "search forever, never commit" looks like.
+### A search penalty is not what prevents runaway searching
 
-This is a small-scale effect, not a refutation: the paper's `PPO-OR` reaches 0.435 EM. The trigger
-is the probability that a batch contains **zero** correct answers, `(1−p)^N` — a smaller model
-lowers `p`, a smaller batch lowers `N`, and they compound in the same exponent. At `p≈0.16` and
-`N=512` an all-zero batch essentially never happens. At ours it is routine.
-
-### 3. What the paper's turn-level gain actually contains
-
-![Waterfall decomposing the MT-PPO gain into reward content and placement](results/phase7c_decomposition.png)
-
-The paper's `PPO-MR → MT-PPO` step changes **two things at once**: it adds reward components (a
-per-turn format term and a search penalty) *and* moves them to turn boundaries. So its published
-gain can't attribute credit between them.
-
-We have the missing control: the same reward content as `MT-PPO`, but flattened to the final
-token. It scores **0.301 EM** — higher than either published arm — which separates the two changes:
-
-| Change | Effect on held-out EM |
-| ------ | --------------------- |
-| Add `λs` + per-turn format **content** | **+0.066** |
-| Move that content to **turn boundaries** (Eq. 9) | **−0.027** |
-| **Net** (= the paper's own comparison) | **+0.039** |
-
-**At this scale the reward components do the work, and turn-level placement gives some of it back.**
-The published net gain is real, but it is the sum of a large positive and a smaller negative — not a
-single effect.
-
-Neither effect can be explained by evaluation noise: both evaluations are deterministic and
-reproduce bit-identically, and on sampling error alone the gaps are ~9 SE and ~3.7 SE. But that is
-the *wrong* error bar to lean on — the dominant uncertainty is seed-to-seed training variance, which
-one seed cannot estimate at all. So: the content effect is large enough to survive a lot of it; the
-placement effect is **suggestive, not settled**.
-
-> This control was not planned. `ppo_mr` was built as a "cleaner" PPO-MR before the paper's actual
-> definition was checked, and the error was caught only when its results were written up — at which
-> point the first pass had already concluded, wrongly, that the paper's central claim *didn't*
-> reproduce. Re-running the faithful baseline reversed that. The accidental arm turned out to be the
-> useful one, but the lesson is the opposite of comfortable: **reproduce faithfully first, then
-> improve.**
-
-### 4. A search penalty is not what prevents runaway searching
-
-The paper warns that removing its search-count penalty "leads to unstable training and degenerate
-behaviors, such as uncontrolled search usage." `PPO-MR` runs with **λs = 0** by the paper's own
-definition — and searched *less* than the penalized arms (2.10 turns/episode vs 2.04 and 2.39), far
-from the 4-turn cap that collapsed `PPO-OR` saturated.
+The paper warns that dropping its search-count penalty causes "uncontrolled search usage." `PPO-MR`
+runs that penalty at **zero** by the paper's own definition — and, in the right-hand panel above,
+sits near 2 searches per episode while the collapsed arm is the one glued to the cap.
 
 What actually bounds search is the **graded** outcome reward: a wrong-but-formatted answer still
 earns +0.2, so there is always positive pressure to stop searching and commit. `PPO-OR` had no such
 term, and that — not the missing penalty — is what let it search forever.
 
-### 5. Reward hacking under an added penalty (our own experiments)
+### The paper's headline gain is two effects, not one
 
-Separately from the reproduction, we stress-tested a GRPO variant using **graded** partial credit
-(F1 + exact-match bonus) instead of the paper's binary reward, under three manufactured pressures.
+The paper's `PPO-MR → MT-PPO` step changes **two things at once**: it adds reward components (a
+per-turn format term and a search penalty) *and* moves them to turn boundaries. Its published gain
+cannot say which one earned the credit.
 
-**These runs are not comparable to the table above** — different reward, different seed (123), and
-600 steps rather than 500. They are their own self-contained experiment, with their own internal
-baseline: **0.242 EM** outcome-only vs **0.306** merged.
+Adding the missing control — the same reward content, flattened back to the final token — separates
+them:
 
-![Held-out exact match across four reward configurations](results/followup_experiments_comparison.png)
+![Waterfall decomposing the MT-PPO gain into reward content and placement](results/phase7c_decomposition.png)
 
-**None improved on the baseline**, and *how* they failed is the same lesson as Result 2 — this time
-triggered by an added penalty rather than a missing bonus:
+**At this scale the reward content does the work (+0.066) and turn-level placement gives some of it
+back (−0.027).** The published net gain is real, but it is a large positive plus a smaller negative,
+not a single effect. The content effect is big enough to survive a lot of seed variance; the
+placement effect is **suggestive, not settled** at n=1.
 
-- **Length penalty** (not from the paper): outcome-only **collapsed to 0.090 EM**, answering in
-  ~12 tokens instead of 386. Merged reward dropped only to 0.254 and stayed coherent.
-- **The paper's search-count penalty, borrowed into GRPO**: outcome-only **collapsed to 0.024 EM**
-  and ~21 tokens. Merged reward fell to 0.221, then partially recovered late in training.
-- **Isolating control** (same prompt change, *no* penalty): outcome-only dropped only to 0.201;
-  merged reward *rose* to 0.320. This pins both collapses on the penalty term itself.
+### Our own experiment: a narrow reward is fragile to added penalties
+
+Beyond the reproduction, we stress-tested a GRPO variant using **graded** partial credit (F1 +
+exact-match bonus) instead of the paper's binary reward, under three manufactured pressures.
+
+![Held-out exact match and completion length across four reward configurations](results/followup_experiments_comparison.png)
+
+**None beat the baseline** — but *how* they failed is the finding. Under either penalty the
+outcome-only arm collapsed to 12- and 21-token answers, while the merged reward degraded and stayed
+coherent. A control with the same prompt change and *no* penalty held up fine, which pins the
+collapses on the penalty term itself rather than on the prompt.
 
 If every rollout in a group finds the same cheap trick, GRPO can't see past it — the whole group
-looks equally bad, so there's no gradient saying it's wrong. A bare penalty with no matching
-positive incentive is genuinely risky under GRPO. Merged reward's extra signal is real but
-**incomplete** protection.
+looks equally bad, so no gradient says it's wrong. A bare penalty with no matching positive
+incentive is genuinely risky under GRPO, and a denser reward is real but **incomplete** protection.
 
 <details>
-<summary>Methodology notes and caveats</summary>
+<summary>Methodology, symmetry checks and caveats</summary>
 
-- **Significance.** The 0.065 EM gap in the graded-reward GRPO baseline is p < 1e-18 (z ≈ 8.8),
-  95% CI ≈ [0.050, 0.079], treating conditions as independent samples. Result 5's follow-ups are
-  single runs without significance tests; the effects there are 3–10× collapses, not the kind of
-  gap run-to-run noise produces.
-- **Evaluation is deterministic.** Both PPO evaluations were run twice on the same checkpoints and
-  reproduced **bit-identically to 16 decimal places** (greedy decoding). All remaining uncertainty
-  is training-run variance, not measurement error.
-- **Seeds.** n=1 against the paper's n=5. Resolving a 1.7-point effect here would need ~6–12 seeds
-  (110–220 GPU-hours), so the small placement effect is deliberately not over-claimed.
+- **Scale.** Six training runs (~14 GPU-hours) and seven full held-out evaluations (~45 GPU-hours)
+  on one RTX 4090.
+- **Symmetry.** Every arm ran 500 steps at seed 42 with identical hyperparameters, took 488–495
+  real gradient updates, and no episode in any PPO arm ended without a chance to answer.
+- **Evaluation is deterministic.** Both PPO evaluations were re-run on the same checkpoints and
+  reproduced **bit-identically to 16 decimal places** (greedy decoding), so all remaining
+  uncertainty is training-run variance, not measurement error. On sampling error alone the two
+  decomposition effects are ~9 SE and ~3.7 SE — but that is the wrong error bar to lean on, which
+  is why the placement effect is not over-claimed.
+- **Seeds.** n=1 against the paper's n=5. Resolving a 1.7-point effect would need ~6–12 seeds
+  (110–220 GPU-hours).
 - **Cross-algorithm comparison is not valid here.** PPO and GRPO arms saw very different amounts of
   data (~1,964 vs ~250 distinct training prompts) because GRPO must spend its whole generation batch
-  on one prompt to form a group baseline. The arms belong in one results table; a PPO-vs-GRPO
-  *causal* claim does not follow from it.
+  on one prompt to form a group baseline. The arms belong in one table; a PPO-vs-GRPO *causal*
+  claim does not follow from it.
+- **The follow-up experiments are their own track**, not comparable to the five arms: graded reward,
+  seed 123, 600 steps, with an internal baseline of 0.242 EM outcome-only vs 0.306 merged.
 - **Retrieval ceiling.** ~20% of HotpotQA's gold passage titles aren't in this Wikipedia snapshot,
   so retrieval fraction can't reach 1.0 even with perfect search.
 
@@ -319,22 +279,18 @@ positive incentive is genuinely risky under GRPO. Merged reward's extra signal i
 
 ### Key learnings
 
-1. **Turn-level reward works, but less of the credit belongs to turn-level *placement* than the
-   headline number suggests.** Reproducing the paper's gain (+0.039 EM) and then decomposing it
-   showed the reward *content* contributing +0.066 and the placement itself −0.027. A published
-   delta that moves two variables at once is worth decomposing before building on it.
-2. **A sparse binary reward is not just slow to learn from — it can be an absorbing state.** When
-   every rollout in a batch scores zero, GRPO's advantage is zero, the gradient is exactly zero, and
-   nothing recovers. Two different algorithms hit this identically. Reward density is a
-   *training-stability* property at small scale, not only an efficiency one.
-3. **Diagnose the mechanism, not the symptom.** `PPO-OR` had the *best* retrieval of any arm and was
-   completely broken. `PPO-MR` ran without the search penalty the paper says prevents runaway search
-   and searched less than the penalized arms. Both headline metrics point the wrong way; only the
-   per-step curves and gradient norms explain what actually happened.
-4. **Reproduce faithfully before improving.** The first pass here measured turn-level placement
-   against a "better" baseline of our own design and concluded the paper's central claim *didn't
-   reproduce*. It did — the deviation was hiding it. The improved variant is genuinely useful, but
-   only as an addition to the faithful reproduction, never as a substitute for it.
+1. **A published delta that moves two variables at once is worth decomposing before building on
+   it.** The paper's turn-level gain reproduced — but most of the credit belongs to *what* the
+   reward contains, not to the turn-level *placement* the paper's contribution is named for.
+2. **Reward density is a training-stability property, not just an efficiency one.** A sparse binary
+   reward can be an absorbing state: zero variance in a batch means zero gradient, and nothing
+   recovers. Two different algorithms hit this identically.
+3. **Diagnose the mechanism, not the symptom.** The single best retrieval score in this whole study
+   belongs to a completely broken model, and the arm running *without* the paper's anti-search
+   penalty searched *less* than the penalized ones. Both headline metrics point the wrong way.
+4. **Reproduce faithfully before improving.** An early pass here measured turn-level placement
+   against a "cleaner" baseline of our own design and concluded the paper's central claim *didn't*
+   reproduce. It did — our own deviation was hiding it.
 
 
 ## Roadmap
@@ -359,7 +315,8 @@ positive incentive is genuinely risky under GRPO. Merged reward's extra signal i
 ├── docs/       # phase docs, design specs, roadmap
 ├── outputs/    # training checkpoints + logs per condition (gitignored)
 ├── results/    # final held-out metrics + comparison plots (committed)
-├── scripts/    # retrieval server, setup/verification, plotting (plot_phase7c.py, compare_runs.py)
+├── scripts/    # retrieval server, setup/verification, plotting (plot_phase7c.py regenerates
+│              #   every README figure from committed data alone)
 ├── src/        # the turn_level_rewards package (env, rewards, metrics, data, train, evaluate)
 └── tests/      # unit tests (fast, no GPU, no live retrieval server)
 ```
