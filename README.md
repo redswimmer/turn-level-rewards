@@ -178,17 +178,11 @@ Same reward, opposite fates — the only thing that changed is scale:
 
 ![Both collapses during training, next to my runs that held](results/phase7c_collapses.png)
 
-`PPO-OR` stopped answering while posting the best retrieval score of any arm. Watch only the
-retrieval metric and the most broken arm looks like the best one.
-
-`GRPO-OR` died differently: once every rollout in a group scores the same, GRPO's advantage is
-zero and the gradient goes to zero for good. `GRPO-MR` is the same arm plus the retrieval bonus,
-and it trained fine.
-
-Why mine and not the paper's? My best guess is scale. Collapse starts with a batch that has zero
-correct answers, which gets more likely as the model gets weaker and the batch gets smaller —
-mine is much smaller on both. Unverified: I never ran the paper's scale. The test: step up
-through the model family (Qwen3.5 ships 2B and 4B) and see where the collapse stops.
+Why mine and not the paper's? My best guess is scale. A batch with zero correct answers teaches
+nothing — every rollout scores the same, so the gradient is zero — and that gets more likely as
+the model gets weaker and the batch gets smaller. Mine is much smaller on both. Unverified: I
+never ran the paper's scale. The test: step up through the model family (Qwen3.5 ships 2B and 4B)
+and see where the collapse stops.
 
 ### A search penalty is not what prevents runaway searching
 

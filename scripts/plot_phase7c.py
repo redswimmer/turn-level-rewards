@@ -220,7 +220,7 @@ def plot_collapses(curves: dict, out: Path) -> None:
             linewidth=2.2 if colour == LOSS else 1.8,
         )
     p_ax.set_title(
-        "Format Correctness (PPO, this repo)", fontsize=11.5, color=INK, weight="bold", pad=8
+        "Training Reward (PPO, this repo)", fontsize=11.5, color=INK, weight="bold", pad=8
     )
     p_ax.set_ylabel("Format Correctness", fontsize=10, color=INK_SOFT)
     p_ax.set_ylim(0, 1.05)
