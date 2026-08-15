@@ -51,7 +51,7 @@ guess, get scored no differently turn-by-turn. GRPO can't isolate which turn ear
 That holds no matter *where* you attach a bonus. GRPO only ever sees one number per trajectory, so
 a bonus placed mid-episode still gets folded into that same number. Actually using *where* a reward
 happened requires a critic that can evaluate any point in a trajectory on its own. PPO has one;
-GRPO doesn't. That's why the last later PPO approaches switch algorithms rather than just rearranging
+GRPO doesn't. That's why the later PPO approaches switch algorithms rather than just rearranging
 the reward.
 
 Each approach below uses the paper's own reward definitions (arXiv:2505.11821 §5.2/§6.1); each
@@ -132,7 +132,7 @@ flowchart LR
 ### 5. `MT-PPO` — turn-level credit assignment
 
 The paper's best method. Same components, but each turn's reward is placed **at the turn that
-earned it** (Eq. 9), so the critic's value estimate differs turn-by-turn.
+earned it**, so the critic's value estimate differs turn-by-turn.
 
 ```mermaid
 flowchart LR
@@ -154,21 +154,25 @@ Those are MT-PPO's own contribution, not baseline components — which turns out
 
 ## Results
 
-Every arm below: same model, same scaffold, same seed, same data, 500 steps each, evaluated on the
-same 7,404 held-out questions. Only the reward differs.
+Every arm below: same model, same scaffold, same seed, same dataset, 500 training steps (except
+`PPO-OR`, stopped at 159 once it had collapsed), evaluated on the same 7,404 held-out questions.
+Only the reward differs.
 
 ![This reproduction against the paper's published results](results/phase7c_vs_paper.png)
 
 | Arm (held-out, 7,404 questions) | Exact match | F1 | Format | Retrieval |
 | ------------------------------- | ----------- | ---- | ------ | --------- |
-| `PPO-OR`* | 0.002 | 0.002 | 0.003 | 0.529 |
-| `PPO-MR`  | 0.235 | 0.301 | 0.642 | 0.551 |
-| `MT-PPO`  | **0.274** | **0.362** | **0.830** | 0.521 |
+| `PPO-OR`* | 0.002 | 0.002 | 0.003 | 0.528 |
+| `PPO-MR`  | 0.235 | 0.301 | 0.642 | **0.551** |
+| `MT-PPO`  | 0.274 | 0.362 | 0.830 | 0.521 |
 | `GRPO-OR` | 0.000 | 0.015 | 0.421 | — |
 | `GRPO-MR` | **0.295** | **0.391** | **0.975** | 0.475 |
+| `PPO-MR + content`† | **0.301** | **0.395** | 0.817 | 0.519 |
 
 `*` scored at its last checkpoint before collapse, the paper's own methodology for its crashed
-baselines. `GRPO-OR`'s reward never inspects retrieval, so that metric doesn't exist for it.
+baselines. `GRPO-OR`'s reward is never given retrieval state, so that metric isn't logged for it.
+`†` not a paper arm — our own control, used in [the decomposition
+below](#the-papers-headline-gain-is-two-effects-not-one).
 
 **Format correctness tracks the paper closely; exact match sits systematically below it** — the
 signature of training a model **8.75× smaller** (`Qwen3.5-0.8B` vs `Qwen2.5-7B`). Format is dense
@@ -181,22 +185,27 @@ roughly where this repo's best *trained* arm lands.
 `PPO-MR → MT-PPO` gains **+0.039 exact match** against the paper's +0.017. On the GRPO side the
 merged reward is the difference between a working model and a dead one: **0.000 → 0.295** EM.
 
-### A binary outcome reward can permanently stop training
+### A binary outcome reward killed both arms that used it
 
 ![PPO arms during training: format compliance and searches per episode](results/phase7c_training.png)
 
-Both binary-outcome-only arms — `PPO-OR` and `GRPO-OR`, two *different algorithms* — died the same
-structural death. `PPO-OR` is visible above: it stops answering entirely and pins itself to the
-4-turn search cap. It ends with the **highest retrieval of any arm** (0.529) and a format
-compliance of **0.003**. It learned to search, and never learned to commit.
+Both binary-outcome-only arms — `PPO-OR` and `GRPO-OR`, two *different algorithms* — were killed by
+the same cause, through **two different mechanisms**.
+
+`PPO-OR` is visible above: it stops answering entirely and pins itself to the 4-turn search cap,
+ending at a format compliance of **0.003** while still retrieving as well as the arms that work
+(0.528). It learned to search and never learned to commit. Its gradient stayed alive the whole
+time — `policy_loss` is nonzero in every one of its final 20 steps — so this is a degenerate policy,
+not a frozen one.
 
 ![GRPO-OR collapsing: reward and reward-variance curves](results/phase7c_collapse.png)
 
-`GRPO-OR` shows the mechanism outright. Once every rollout in a group scores identically, GRPO's
-advantage — `(rᵢ − group mean) / group std` — is zero, so the gradient is **exactly 0.0000 for the
-final 300 steps**. Checkpoints 450 and 500 are byte-identical, and the frozen policy never called
-search once across all 7,404 held-out questions. A sparse binary reward isn't just slow to learn
-from; it's an absorbing state you cannot leave.
+`GRPO-OR` failed harder, and its mechanism is exact. Once every rollout in a group scores
+identically, GRPO's advantage — `(rᵢ − group mean) / group std` — is zero, so the gradient is
+**exactly 0.0000 from step 186 to 499**. Checkpoints 450 and 500 are byte-identical, and the frozen
+policy never called search once across all 7,404 held-out questions. Under GRPO specifically, a
+sparse binary reward isn't just slow to learn from; it's an absorbing state you cannot leave. PPO's
+critic spares it that — and still produced a model that never answers.
 
 This is a small-scale effect, not a refutation — the paper's `PPO-OR` reaches 0.435 EM. What
 triggers it is the chance a batch contains **zero** correct answers, `(1−p)^N`: a smaller model
@@ -249,8 +258,10 @@ incentive is genuinely risky under GRPO, and a denser reward is real but **incom
 
 - **Scale.** Six training runs (~14 GPU-hours) and seven full held-out evaluations (~45 GPU-hours)
   on one RTX 4090.
-- **Symmetry.** Every arm ran 500 steps at seed 42 with identical hyperparameters, took 488–495
-  real gradient updates, and no episode in any PPO arm ended without a chance to answer.
+- **Symmetry.** Every arm ran at seed 42 with identical hyperparameters, and no episode in any PPO
+  arm ended without a chance to answer. The arms that trained to completion took 488–495 real
+  gradient updates out of 500 steps (the rest skipped for OOM); `PPO-OR` is the exception, stopped
+  at step 159 once collapsed.
 - **Evaluation is deterministic.** Both PPO evaluations were re-run on the same checkpoints and
   reproduced **bit-identically to 16 decimal places** (greedy decoding), so all remaining
   uncertainty is training-run variance, not measurement error. On sampling error alone the two
@@ -274,12 +285,14 @@ incentive is genuinely risky under GRPO, and a denser reward is real but **incom
 1. **A published delta that moves two variables at once is worth decomposing before building on
    it.** The paper's turn-level gain reproduced — but most of the credit belongs to *what* the
    reward contains, not to the turn-level *placement* the paper's contribution is named for.
-2. **Reward density is a training-stability property, not just an efficiency one.** A sparse binary
-   reward can be an absorbing state: zero variance in a batch means zero gradient, and nothing
-   recovers. Two different algorithms hit this identically.
-3. **Diagnose the mechanism, not the symptom.** The single best retrieval score in this whole study
-   belongs to a completely broken model, and the arm running *without* the paper's anti-search
-   penalty searched *less* than the penalized ones. Both headline metrics point the wrong way.
+2. **Reward density is a training-stability property, not just an efficiency one.** A binary reward
+   killed both outcome-only arms, but by different routes: under GRPO it was an absorbing state
+   (zero within-group variance means a gradient of exactly zero, and nothing recovers), while PPO's
+   critic kept the gradient alive and still converged on a model that never answers.
+3. **Diagnose the mechanism, not the symptom.** A completely broken model retrieved about as well
+   as the arms that worked, and the arm running *without* the paper's anti-search penalty searched
+   no more than the penalized ones. Headline metrics pointed the wrong way in both cases; only the
+   per-step curves explained what happened.
 4. **Reproduce faithfully before improving.** An early pass here measured turn-level placement
    against a "cleaner" baseline of our own design and concluded the paper's central claim *didn't*
    reproduce. It did — our own deviation was hiding it.
