@@ -127,8 +127,8 @@ def build_config(
         save_steps=50,
         save_total_limit=3,
         report_to="trackio",
-        # The paper-faithful arms share ONE trackio project with the PPO arms so all five of
-        # them overlay in a single dashboard -- that five-arm view IS the deliverable. The
+        # The paper-faithful arms share ONE trackio project with the PPO arms so every arm
+        # overlays in a single dashboard -- that combined view IS the deliverable. The
         # original outcome_only/turn_level runs stay in their own project so this repo's
         # earlier, non-paper-reward results are not silently mixed in with the reproduction.
         project=(

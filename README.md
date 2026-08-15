@@ -247,8 +247,8 @@ incentive is genuinely risky under GRPO, and a denser reward is real but **incom
 <details>
 <summary>Methodology, symmetry checks and caveats</summary>
 
-- **Scale.** Six training runs (~14 GPU-hours) and seven full held-out evaluations (~45 GPU-hours)
-  on one RTX 4090.
+- **Scale.** All training and evaluation ran on one RTX 4090 — roughly 14 GPU-hours of training
+  and 45 of held-out evaluation.
 - **Symmetry.** Every arm ran at seed 42 with identical hyperparameters, and no episode in any PPO
   arm ended without a chance to answer. The arms that trained to completion took 488–495 real
   gradient updates out of 500 steps (the rest skipped for OOM); `PPO-OR` is the exception, stopped
